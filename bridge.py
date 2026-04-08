@@ -94,8 +94,9 @@ BOT_ID_FILE = Path(".bot_id")
 # Глобальное состояние
 # ─────────────────────────────────────────────────────────────────
 _bot_id: int = 0
-_tg_client: Any = None          # Telethon TelegramClient
-_employee_ids: set[int] = set() # ID сотрудников Битрикс24 (кешируем при старте)
+_tg_client: Any = None    # Telethon TelegramClient
+# ID сотрудников Битрикс24 → {"name": str, "position": str}
+_employees: dict[int, dict] = {}
 
 # ─────────────────────────────────────────────────────────────────
 # Битрикс24 REST
@@ -158,20 +159,30 @@ async def get_or_register_bot() -> int:
     return bot_id
 
 
-async def get_all_employee_ids() -> list[int]:
-    """Возвращает список ID всех активных сотрудников из Битрикс24."""
-    result = await b24("user.get", {"ACTIVE": True})
-    return [int(u["ID"]) for u in result]
+async def fetch_all_employees() -> dict[int, dict]:
+    """Загружает всех активных сотрудников и возвращает {id: {name, position}}."""
+    result = await b24("user.get", {
+        "ACTIVE": True,
+        "select": ["ID", "NAME", "LAST_NAME", "WORK_POSITION"],
+    })
+    return {
+        int(u["ID"]): {
+            "name":     f"{u.get('NAME', '')} {u.get('LAST_NAME', '')}".strip(),
+            "position": (u.get("WORK_POSITION") or "").strip(),
+        }
+        for u in result
+    }
 
 
-async def _create_bitrix_chat(title: str) -> str:
-    """Создаёт групповой чат со всеми сотрудниками и возвращает dialog_id вида 'chatN'."""
-    employee_ids = await get_all_employee_ids()
+async def _create_bitrix_chat(title: str, user_ids: list[int] | None = None) -> str:
+    """Создаёт групповой чат с указанными (или всеми) сотрудниками и возвращает dialog_id вида 'chatN'."""
+    if user_ids is None:
+        user_ids = list(_employees.keys()) if _employees else list((await fetch_all_employees()).keys())
     result = await b24("imbot.chat.add", {
         "BOT_ID": _bot_id,
         "TITLE":  title,
         "TYPE":   "CHAT",
-        "USERS":  employee_ids,
+        "USERS":  user_ids,
     })
     return f"chat{result}"
 
@@ -220,19 +231,90 @@ async def handle_incoming(
     dialog_id = contact.bitrix_chat_id
 
     if not dialog_id:
-        title = f"👤 {contact.name}"
-        dialog_id = await _create_bitrix_chat(title)
+        # Анализируем клиента через AI и подбираем команду
+        card, team = await _create_card_and_assign_team(contact, text)
+
+        # Определяем кого добавить в чат
+        if team:
+            chat_user_ids = [e.bitrix_user_id for e in team]
+            priority_label = card.priority
+        else:
+            chat_user_ids = None  # fallback: все сотрудники
+            priority_label = "Средний"
+
+        priority_emoji = {"VIP": "🔥", "Высокий": "🟠", "Средний": "🟡", "Низкий": "🟢"}.get(priority_label, "⚪")
+        title = f"{priority_emoji} {contact.name} [{priority_label}]"
+        dialog_id = await _create_bitrix_chat(title, chat_user_ids)
         await db.set_chat(contact.id, dialog_id)
 
-        # Шапка с данными контакта
+        # Шапка с данными контакта и карточкой
         lines = [f"👤 *Контакт: {contact.name}*"]
         if contact.telegram_id:
             tg_link = contact.telegram_username or f"tg_id:{contact.telegram_id}"
             lines.append(f"✈️ Telegram: {tg_link}")
         if contact.email:
             lines.append(f"📧 Email: {contact.email}")
+        lines.append("")
+        lines.append(f"📋 *Карточка клиента #{card.id}*")
+        lines.append(f"Приоритет: {priority_emoji} {card.priority}")
+        if card.company:
+            lines.append(f"Компания: {card.company}")
+        if card.segment:
+            lines.append(f"Сегмент: {card.segment}")
+        if card.product_type:
+            lines.append(f"Продукция: {card.product_type}")
+        if card.volume:
+            lines.append(f"Объём: {card.volume}")
+        if card.notes:
+            lines.append(f"Заметка: {card.notes}")
+        if team:
+            lines.append("")
+            lines.append("👥 *Назначенная команда:*")
+            for emp in team:
+                lines.append(f"  • {emp.name} — {emp.role} (рейтинг: {emp.rating}/10)")
+
         await _bot_send(dialog_id, "\n".join(lines))
-        log.info("Создан чат %s для контакта %s", dialog_id, contact.name)
+
+        # ── Устанавливаем описание чата (видно всегда в шапке) ──
+        chat_id_num = dialog_id.replace("chat", "")
+        desc_lines = [f"Приоритет: {priority_emoji} {card.priority}"]
+        if card.company:
+            desc_lines.append(f"Компания: {card.company}")
+        if card.segment:
+            desc_lines.append(f"Сегмент: {card.segment}")
+        if card.product_type:
+            desc_lines.append(f"Продукция: {card.product_type}")
+        if card.volume:
+            desc_lines.append(f"Объём: {card.volume}")
+        if team:
+            desc_lines.append("Команда: " + ", ".join(f"{e.name} ({e.role})" for e in team))
+        try:
+            await b24("im.chat.update", {
+                "CHAT_ID": int(chat_id_num),
+                "DESCRIPTION": "\n".join(desc_lines),
+            })
+        except Exception as exc:
+            log.warning("Не удалось обновить описание чата: %s", exc)
+
+        # ── Закрепляем сообщение с карточкой ──
+        try:
+            # Получаем последнее сообщение бота (карточка) и пиним его
+            msgs = await b24("im.dialog.messages.get", {
+                "DIALOG_ID": dialog_id,
+                "LIMIT": 1,
+            })
+            msg_list = msgs.get("messages", []) if isinstance(msgs, dict) else []
+            if msg_list:
+                pin_msg_id = msg_list[0].get("id") or msg_list[0].get("ID")
+                if pin_msg_id:
+                    await b24("im.chat.pin", {
+                        "CHAT_ID": int(chat_id_num),
+                        "MESSAGE_ID": int(pin_msg_id),
+                    })
+        except Exception as exc:
+            log.warning("Не удалось закрепить сообщение: %s", exc)
+
+        log.info("Создан чат %s для контакта %s (приоритет: %s)", dialog_id, contact.name, priority_label)
 
     await _bot_send(dialog_id, f"{emoji} [{sender_name}]: {text}")
     log.info("Сообщение → %s (%s)", dialog_id, contact.name)
@@ -389,7 +471,7 @@ def _parse_bitrix_event(raw: dict) -> dict:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _bot_id, _employee_ids
+    global _bot_id, _employees
 
     if not BITRIX_WEBHOOK:
         log.error("BITRIX_WEBHOOK не задан! Укажите его в .env")
@@ -401,8 +483,8 @@ async def lifespan(app: FastAPI):
 
     _bot_id = await get_or_register_bot()
 
-    _employee_ids = set(await get_all_employee_ids())
-    log.info("Сотрудники Битрикс24: %s", _employee_ids)
+    _employees = await fetch_all_employees()
+    log.info("Сотрудники Битрикс24: %s", {uid: e["name"] for uid, e in _employees.items()})
 
     tg_client = await start_telegram()
 
@@ -574,10 +656,10 @@ async def handle_bitrix_event(request: Request):
             log.info("  Пропущено: сообщение от самого бота (bot_id=%d)", _bot_id)
             return JSONResponse({"status": "ok"})
 
-        if _employee_ids and from_user_id not in _employee_ids:
+        if _employees and from_user_id not in _employees:
             log.info(
                 "  Пропущено: from_user_id=%d не найден в сотрудниках %s",
-                from_user_id, _employee_ids,
+                from_user_id, list(_employees.keys()),
             )
             return JSONResponse({"status": "ok"})
 
@@ -601,6 +683,16 @@ async def handle_bitrix_event(request: Request):
         if not clean_message:
             log.info("  Пропущено: после очистки BB-кода сообщение пустое")
             return JSONResponse({"status": "ok"})
+
+        # Добавляем подпись сотрудника
+        employee = _employees.get(from_user_id, {})
+        emp_name = employee.get("name", "")
+        emp_pos  = employee.get("position", "")
+        if emp_name:
+            signature = f"\n\nС уважением,\n{emp_name}"
+            if emp_pos:
+                signature += f", {emp_pos}"
+            clean_message = clean_message + signature
 
         log.info(
             "  Пересылаем → %s (TG %s): %s",
@@ -637,6 +729,12 @@ class ContactCreate(BaseModel):
     email: Optional[str] = None
 
 
+class LinkChannel(BaseModel):
+    email: Optional[str] = None
+    telegram_id: Optional[str] = None
+    telegram_username: Optional[str] = None
+
+
 @app.post("/contacts", status_code=201)
 async def register_contact(data: ContactCreate):
     """
@@ -655,6 +753,40 @@ async def register_contact(data: ContactCreate):
         telegram_username=data.telegram_username,
         email=data.email,
     )
+    return {
+        "id":                contact.id,
+        "name":              contact.name,
+        "telegram_id":       contact.telegram_id,
+        "telegram_username": contact.telegram_username,
+        "email":             contact.email,
+        "bitrix_chat_id":    contact.bitrix_chat_id,
+    }
+
+
+@app.post("/contacts/{contact_id}/link")
+async def link_channel_to_contact(contact_id: int, data: LinkChannel):
+    """
+    Привязать email и/или telegram к существующему контакту.
+    Например, чтобы письма с определённого email попадали в чат этого клиента.
+    """
+    if not data.email and not data.telegram_id:
+        return JSONResponse(
+            {"error": "Укажите хотя бы email или telegram_id"},
+            status_code=400,
+        )
+    try:
+        contact = await db.link_channel(
+            contact_id=contact_id,
+            email=data.email,
+            telegram_id=data.telegram_id,
+            telegram_username=data.telegram_username,
+        )
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=409)
+
+    if not contact:
+        return JSONResponse({"error": "Контакт не найден"}, status_code=404)
+
     return {
         "id":                contact.id,
         "name":              contact.name,
@@ -694,19 +826,12 @@ async def clear_contacts():
 
 @app.get("/employees")
 async def list_employees():
-    """Получить всех активных сотрудников из Битрикс24."""
-    result = await b24("user.get", {
-        "ACTIVE": True,
-        "select": ["ID", "NAME", "LAST_NAME", "EMAIL", "WORK_POSITION"],
-    })
+    """Получить всех активных сотрудников из Битрикс24 (с обновлением кэша)."""
+    global _employees
+    _employees = await fetch_all_employees()
     return [
-        {
-            "id":            int(u["ID"]),
-            "name":          f"{u.get('NAME', '')} {u.get('LAST_NAME', '')}".strip(),
-            "email":         u.get("EMAIL", ""),
-            "work_position": u.get("WORK_POSITION", ""),
-        }
-        for u in result
+        {"id": uid, "name": e["name"], "position": e["position"]}
+        for uid, e in _employees.items()
     ]
 
 
@@ -962,6 +1087,399 @@ async def generate_brief(contact_id: int):
         return {"contact_id": contact_id, "contact_name": contact.name, "raw": raw}
 
     return {"contact_id": contact_id, "contact_name": contact.name, "brief": brief}
+
+
+# ─────────────────────────────────────────────────────────────────
+# AI-анализ клиента и подбор группы сотрудников
+# ─────────────────────────────────────────────────────────────────
+_CLIENT_ANALYSIS_SYSTEM = """\
+Ты — ассистент менеджера по B2B-продажам печатной продукции и упаковки.
+Проанализируй первое сообщение (или переписку) нового клиента и верни ТОЛЬКО валидный JSON:
+
+{
+  "company":      "название компании клиента (если не найдено — null)",
+  "segment":      "отрасль / сегмент (напитки, продукты, фармацевтика и т.д., если неясно — null)",
+  "product_type": "тип продукции / материал (самоклейка, гофрокороб, PET и т.д., если неясно — null)",
+  "volume":       "предполагаемый объём / тираж (если упомянут, иначе null)",
+  "priority":     "VIP | Высокий | Средний | Низкий",
+  "reasoning":    "краткое обоснование выбранного приоритета (1-2 предложения)"
+}
+
+Критерии приоритета:
+- VIP: крупная компания, большие объёмы, стратегически важный сегмент, срочность, упоминание тендера или долгосрочного контракта
+- Высокий: средний бизнес, конкретный крупный заказ, понятные требования
+- Средний: стандартный запрос, малый/средний объём
+- Низкий: разовый мелкий запрос, неясные потребности, просто вопрос без намерения заказать\
+"""
+
+
+async def _analyze_client(contact_name: str, message_text: str) -> dict:
+    """Анализирует сообщение клиента через AI и возвращает структурированные данные."""
+    import json as _json
+    try:
+        prompt = [
+            {"role": "system", "content": _CLIENT_ANALYSIS_SYSTEM},
+            {"role": "user", "content": f"Клиент: {contact_name}\n\nСообщение:\n{message_text}"},
+        ]
+        raw = await _openrouter_chat(prompt, json_mode=True)
+        return _json.loads(raw)
+    except Exception as exc:
+        log.warning("AI-анализ клиента не удался: %s", exc)
+        return {"priority": "Средний"}
+
+
+async def _select_team_for_client(priority: str) -> list[db.Employee]:
+    """
+    Подбирает группу из 5 ролей для клиента.
+    VIP → самые опытные (наивысший rating), остальные → не обязательно лучшие.
+    """
+    all_employees = await db.list_employees()
+    if not all_employees:
+        return []
+
+    by_role: dict[str, list[db.Employee]] = {}
+    for emp in all_employees:
+        by_role.setdefault(emp.role, []).append(emp)
+
+    # Сортируем по рейтингу: для VIP — лучших первыми
+    is_vip = priority in ("VIP", "Высокий")
+
+    team: list[db.Employee] = []
+    for role in db.VALID_ROLES:
+        candidates = by_role.get(role, [])
+        if not candidates:
+            continue
+        candidates.sort(key=lambda e: e.rating, reverse=True)
+        if is_vip:
+            # Берём самого опытного
+            team.append(candidates[0])
+        else:
+            # Берём наименее загруженного / среднего (последний по рейтингу, но не худший)
+            idx = len(candidates) // 2 if len(candidates) > 2 else 0
+            team.append(candidates[idx])
+    return team
+
+
+async def _create_card_and_assign_team(
+    contact: db.Contact, first_message: str
+) -> tuple[db.ClientCard, list[db.Employee]]:
+    """
+    Создаёт карточку клиента, анализирует через AI, подбирает команду.
+    Возвращает (карточку, список сотрудников).
+    """
+    import json as _json
+
+    analysis = await _analyze_client(contact.name, first_message)
+    priority = analysis.get("priority", "Средний")
+    team = await _select_team_for_client(priority)
+
+    assigned_ids = [e.bitrix_user_id for e in team]
+    card = await db.create_client_card(
+        contact_id=contact.id,
+        company=analysis.get("company"),
+        segment=analysis.get("segment"),
+        product_type=analysis.get("product_type"),
+        volume=analysis.get("volume"),
+        priority=priority,
+        notes=analysis.get("reasoning"),
+        assigned_employees=_json.dumps(assigned_ids),
+    )
+    log.info(
+        "Карточка клиента #%d создана: priority=%s, team=%s",
+        card.id, priority, [(e.name, e.role) for e in team],
+    )
+    return card, team
+
+
+# ─────────────────────────────────────────────────────────────────
+# REST: Управление сотрудниками
+# ─────────────────────────────────────────────────────────────────
+class EmployeeCreate(BaseModel):
+    bitrix_user_id: int
+    name: str
+    role: str
+    experience_text: str = ""
+    rating: int = 5
+
+
+@app.post("/employees/register", status_code=201)
+async def register_employee(data: EmployeeCreate):
+    """Зарегистрировать или обновить сотрудника с описанием опыта."""
+    if data.role not in db.VALID_ROLES:
+        return JSONResponse(
+            {"error": f"Неверная роль. Допустимые: {db.VALID_ROLES}"},
+            status_code=400,
+        )
+    if not 1 <= data.rating <= 10:
+        return JSONResponse({"error": "rating должен быть от 1 до 10"}, status_code=400)
+    emp = await db.upsert_employee(
+        bitrix_user_id=data.bitrix_user_id,
+        name=data.name,
+        role=data.role,
+        experience_text=data.experience_text,
+        rating=data.rating,
+    )
+    return {
+        "id": emp.id,
+        "bitrix_user_id": emp.bitrix_user_id,
+        "name": emp.name,
+        "role": emp.role,
+        "experience_text": emp.experience_text,
+        "rating": emp.rating,
+    }
+
+
+@app.get("/employees/team")
+async def list_team():
+    """Список всех зарегистрированных сотрудников отдела продаж."""
+    employees = await db.list_employees()
+    return [
+        {
+            "id": e.id,
+            "bitrix_user_id": e.bitrix_user_id,
+            "name": e.name,
+            "role": e.role,
+            "experience_text": e.experience_text,
+            "rating": e.rating,
+        }
+        for e in employees
+    ]
+
+
+# ─────────────────────────────────────────────────────────────────
+# REST: Карточки клиентов
+# ─────────────────────────────────────────────────────────────────
+@app.get("/client-cards")
+async def list_cards():
+    """Список всех карточек клиентов."""
+    cards = await db.list_client_cards()
+    return [
+        {
+            "id": c.id,
+            "contact_id": c.contact_id,
+            "company": c.company,
+            "segment": c.segment,
+            "product_type": c.product_type,
+            "volume": c.volume,
+            "priority": c.priority,
+            "notes": c.notes,
+            "assigned_employees": c.assigned_employees,
+            "created_at": c.created_at,
+        }
+        for c in cards
+    ]
+
+
+@app.get("/client-cards/{card_id}")
+async def get_card(card_id: int):
+    """Получить карточку клиента по ID."""
+    card = await db.get_client_card(card_id)
+    if not card:
+        return JSONResponse({"error": "Карточка не найдена"}, status_code=404)
+    return {
+        "id": card.id,
+        "contact_id": card.contact_id,
+        "company": card.company,
+        "segment": card.segment,
+        "product_type": card.product_type,
+        "volume": card.volume,
+        "priority": card.priority,
+        "notes": card.notes,
+        "assigned_employees": card.assigned_employees,
+        "created_at": card.created_at,
+    }
+
+
+@app.get("/contacts/{contact_id}/card")
+async def get_contact_card(contact_id: int):
+    """Получить карточку клиента по ID контакта."""
+    card = await db.get_card_by_contact(contact_id)
+    if not card:
+        return JSONResponse({"error": "Карточка не найдена для этого контакта"}, status_code=404)
+    return {
+        "id": card.id,
+        "contact_id": card.contact_id,
+        "company": card.company,
+        "segment": card.segment,
+        "product_type": card.product_type,
+        "volume": card.volume,
+        "priority": card.priority,
+        "notes": card.notes,
+        "assigned_employees": card.assigned_employees,
+        "created_at": card.created_at,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────
+# Интеграция с телефонией (phone_recording)
+# ─────────────────────────────────────────────────────────────────
+class CallSummaryRequest(BaseModel):
+    call_id: str
+    chat_id: int | str
+    chat_title: str
+    summary_markdown: str
+    transcript_text: str | None = None
+    started_at: str | None = None
+    finished_at: str | None = None
+    participants: list[str] | None = None  # имена участников звонка
+
+
+async def _find_contact_for_call(
+    chat_title: str,
+    participants: list[str] | None,
+) -> Optional[db.Contact]:
+    """
+    Ищет контакт в БД по участникам звонка или названию чата.
+    Сначала проверяет имена участников, потом title чата.
+    """
+    all_contacts = await db.list_all()
+    if not all_contacts:
+        return None
+
+    # 1. Ищем по именам участников (точное совпадение имени контакта)
+    if participants:
+        for p_name in participants:
+            p_lower = p_name.lower().strip()
+            for c in all_contacts:
+                if c.name.lower().strip() == p_lower:
+                    return c
+
+    # 2. Ищем по вхождению имени контакта в title чата
+    title_lower = chat_title.lower()
+    for c in all_contacts:
+        if c.name.lower().strip() in title_lower:
+            return c
+
+    # 3. Частичное совпадение участников
+    if participants:
+        for p_name in participants:
+            p_parts = set(p_name.lower().split())
+            for c in all_contacts:
+                c_parts = set(c.name.lower().split())
+                if p_parts and c_parts and p_parts & c_parts:
+                    return c
+
+    return None
+
+
+@app.post("/call-summary")
+async def receive_call_summary(data: CallSummaryRequest):
+    """
+    Принимает summary звонка от сервиса phone_recording.
+    Находит контакт и отправляет summary в его Битрикс-чат.
+    Если контакта нет — создаёт нового + карточку + чат.
+    """
+    log.info(
+        "Получен summary звонка: call_id=%s, chat=%s, participants=%s",
+        data.call_id, data.chat_title, data.participants,
+    )
+
+    # ── 1. Ищем контакт ──
+    contact = await _find_contact_for_call(data.chat_title, data.participants)
+
+    if contact is None:
+        # Создаём нового контакта по данным звонка
+        client_name = data.chat_title.strip()
+        if data.participants:
+            # Берём первого участника, который не сотрудник
+            employee_names = {e["name"].lower() for e in _employees.values()} if _employees else set()
+            for p in data.participants:
+                if p.lower().strip() not in employee_names:
+                    client_name = p.strip()
+                    break
+
+        contact = await db.upsert_contact(name=client_name)
+        log.info("Создан контакт из звонка: %s (ID=%d)", client_name, contact.id)
+
+    # ── 2. Получить или создать Битрикс-чат ──
+    dialog_id = contact.bitrix_chat_id
+
+    if not dialog_id:
+        # Создаём карточку на основе summary звонка
+        card, team = await _create_card_and_assign_team(contact, data.summary_markdown)
+
+        if team:
+            chat_user_ids = [e.bitrix_user_id for e in team]
+            priority_label = card.priority
+        else:
+            chat_user_ids = None
+            priority_label = "Средний"
+
+        priority_emoji = {"VIP": "🔥", "Высокий": "🟠", "Средний": "🟡", "Низкий": "🟢"}.get(priority_label, "⚪")
+        title = f"{priority_emoji} {contact.name} [{priority_label}]"
+        dialog_id = await _create_bitrix_chat(title, chat_user_ids)
+        await db.set_chat(contact.id, dialog_id)
+
+        # Шапка чата
+        lines = [f"👤 *Контакт: {contact.name}*"]
+        if contact.telegram_id:
+            lines.append(f"✈️ Telegram: {contact.telegram_username or contact.telegram_id}")
+        if contact.email:
+            lines.append(f"📧 Email: {contact.email}")
+        lines.append("")
+        lines.append(f"📋 *Карточка клиента #{card.id}*")
+        lines.append(f"Приоритет: {priority_emoji} {card.priority}")
+        if card.company:
+            lines.append(f"Компания: {card.company}")
+        if card.segment:
+            lines.append(f"Сегмент: {card.segment}")
+        if team:
+            lines.append("")
+            lines.append("👥 *Назначенная команда:*")
+            for emp in team:
+                lines.append(f"  • {emp.name} — {emp.role} (рейтинг: {emp.rating}/10)")
+
+        await _bot_send(dialog_id, "\n".join(lines))
+
+        # Описание чата
+        chat_id_num = dialog_id.replace("chat", "")
+        desc_lines = [f"Приоритет: {priority_emoji} {card.priority}"]
+        if card.company:
+            desc_lines.append(f"Компания: {card.company}")
+        if team:
+            desc_lines.append("Команда: " + ", ".join(f"{e.name} ({e.role})" for e in team))
+        try:
+            await b24("im.chat.update", {
+                "CHAT_ID": int(chat_id_num),
+                "DESCRIPTION": "\n".join(desc_lines),
+            })
+        except Exception:
+            pass
+
+        log.info("Создан чат %s для контакта %s из звонка", dialog_id, contact.name)
+
+    # ── 3. Отправляем summary в чат ──
+    time_info = ""
+    if data.started_at:
+        time_info = f"\n🕐 Начало: {data.started_at}"
+    if data.finished_at:
+        time_info += f"\n🕐 Окончание: {data.finished_at}"
+
+    summary_message = (
+        f"📞 *Summary звонка*{time_info}\n"
+        f"call_id: {data.call_id}\n\n"
+        f"{data.summary_markdown}"
+    )
+    await _bot_send(dialog_id, summary_message)
+
+    # Если есть транскрипция — отправляем отдельным сообщением (укороченно)
+    if data.transcript_text:
+        transcript_preview = data.transcript_text[:3000]
+        if len(data.transcript_text) > 3000:
+            transcript_preview += "\n\n... (транскрипция обрезана)"
+        await _bot_send(dialog_id, f"📝 *Транскрипция звонка:*\n\n{transcript_preview}")
+
+    log.info(
+        "Summary звонка %s отправлен в чат %s контакта %s",
+        data.call_id, dialog_id, contact.name,
+    )
+
+    return {
+        "status": "ok",
+        "contact_id": contact.id,
+        "contact_name": contact.name,
+        "bitrix_chat_id": dialog_id,
+    }
 
 
 @app.get("/health")
