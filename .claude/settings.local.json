@@ -1,0 +1,25 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(find /Users/mitkovanton/Workspace/hackathon-flex -type f -name .*)",
+      "Bash(grep -v \"^\\\\.$\\\\|^\\\\.\\\\.$\")",
+      "Bash(uv run:*)",
+      "Bash(curl -sL --max-time 30 \"https://dev.1c-bitrix.ru/learning/course/index.php?COURSE_ID=93&LESSON_ID=7875\")",
+      "Bash(curl -s -L https://apidocs.bitrix24.com/api-reference/chat-bots/messages/events/on-im-bot-message-add.html)",
+      "Bash(curl -s -L https://dev.1c-bitrix.ru/rest_help/chat_bots/events/onImBotMessageAdd.php)",
+      "Bash(curl -sL --max-time 30 \"https://dev.1c-bitrix.ru/learning/course/index.php?COURSE_ID=93&LESSON_ID=12113\")",
+      "Bash(curl -sL --max-time 30 \"https://apidocs.bitrix24.com/api-reference/chat-bots/messages/events/on-im-bot-message-add.html\")",
+      "WebFetch(domain:apidocs.bitrix24.com)",
+      "WebFetch(domain:dev.1c-bitrix.ru)",
+      "WebFetch(domain:apidocs.bitrix24.ru)",
+      "Bash(curl:*)",
+      "WebSearch",
+      "WebFetch(domain:training.bitrix24.com)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:hub.ability.ai)",
+      "Bash(python:*)",
+      "Bash(python3:*)"
+    ]
+  }
+}
