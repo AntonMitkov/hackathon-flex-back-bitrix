@@ -56,6 +56,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 import db
+from anonymizer import TextAnonymizer
 
 load_dotenv()
 logging.basicConfig(
@@ -315,6 +316,15 @@ async def handle_incoming(
             log.warning("Не удалось закрепить сообщение: %s", exc)
 
         log.info("Создан чат %s для контакта %s (приоритет: %s)", dialog_id, contact.name, priority_label)
+
+    else:
+        # Возвращающийся клиент — проверяем доступность менеджеров
+        card = await db.get_card_by_contact(contact.id)
+        if card:
+            try:
+                await _check_manager_availability_for_contact(contact, card, dialog_id)
+            except Exception as exc:
+                log.warning("Ошибка проверки доступности менеджеров: %s", exc)
 
     await _bot_send(dialog_id, f"{emoji} [{sender_name}]: {text}")
     log.info("Сообщение → %s (%s)", dialog_id, contact.name)
@@ -993,20 +1003,26 @@ async def generate_summary(contact_id: int):
     messages = await _fetch_dialog_messages(contact.bitrix_chat_id)
     transcript = _messages_to_transcript(messages, contact.name)
 
+    anon = TextAnonymizer()
+    anon_name = anon.add(contact.name, kind="name")
+    anon_email = anon.add(contact.email, kind="email") if contact.email else None
+    anon_transcript = anon.anonymize(transcript)
+
     prompt = [
         {"role": "system", "content": _SUMMARY_SYSTEM},
         {
             "role": "user",
             "content": (
-                f"Контакт: {contact.name}"
-                + (f"\nEmail: {contact.email}" if contact.email else "")
-                + f"\n\nПереписка:\n{transcript}"
+                f"Контакт: {anon_name}"
+                + (f"\nEmail: {anon_email}" if anon_email else "")
+                + f"\n\nПереписка:\n{anon_transcript}"
             ),
         },
     ]
 
     import json as _json
     raw = await _openrouter_chat(prompt, json_mode=True)
+    raw = anon.deanonymize(raw)
     log.info("Summary сгенерирован для контакта %d (%s)", contact_id, contact.name)
 
     try:
@@ -1050,6 +1066,12 @@ async def generate_brief(contact_id: int):
     messages = await _fetch_dialog_messages(contact.bitrix_chat_id, limit=100)
     transcript = _messages_to_transcript(messages, contact.name)
 
+    anon = TextAnonymizer()
+    anon_name = anon.add(contact.name, kind="name")
+    anon_email = anon.add(contact.email, kind="email") if contact.email else None
+    anon_tg = anon.add(contact.telegram_username, kind="telegram") if contact.telegram_username else None
+    anon_transcript = anon.anonymize(transcript)
+
     system_prompt = """Ты — эксперт по B2B-продажам печатной продукции и упаковки.
 Проанализируй переписку с клиентом и верни ТОЛЬКО валидный JSON (без markdown, без пояснений) со следующими полями:
 
@@ -1067,20 +1089,22 @@ async def generate_brief(contact_id: int):
 Для оценки churn_risk учитывай: длину паузы в переписке, наличие возражений, упоминание конкурентов, неопределённость клиента.
 Для priority учитывай: объём заказа, частоту коммуникации, стратегическую важность."""
 
+    tg_display = anon_tg or (str(contact.telegram_id) if contact.telegram_id else None)
     prompt = [
         {"role": "system", "content": system_prompt},
         {
             "role": "user",
             "content": (
-                f"Контакт: {contact.name}"
-                + (f"\nEmail: {contact.email}" if contact.email else "")
-                + (f"\nTelegram: {contact.telegram_username or contact.telegram_id}" if contact.telegram_id else "")
-                + f"\n\nПереписка:\n{transcript}"
+                f"Контакт: {anon_name}"
+                + (f"\nEmail: {anon_email}" if anon_email else "")
+                + (f"\nTelegram: {tg_display}" if tg_display else "")
+                + f"\n\nПереписка:\n{anon_transcript}"
             ),
         },
     ]
 
     raw = await _openrouter_chat(prompt, json_mode=True)
+    raw = anon.deanonymize(raw)
     log.info("Brief сгенерирован для контакта %d (%s)", contact_id, contact.name)
 
     try:
@@ -1125,31 +1149,67 @@ async def _analyze_client(contact_name: str, message_text: str) -> dict:
     """Анализирует сообщение клиента через AI и возвращает структурированные данные."""
     import json as _json
     try:
+        anon = TextAnonymizer()
+        anon_name = anon.add(contact_name, kind="name")
+        anon_message = anon.anonymize(message_text)
         prompt = [
             {"role": "system", "content": _CLIENT_ANALYSIS_SYSTEM},
-            {"role": "user", "content": f"Клиент: {contact_name}\n\nСообщение:\n{message_text}"},
+            {"role": "user", "content": f"Клиент: {anon_name}\n\nСообщение:\n{anon_message}"},
         ]
         raw = await _openrouter_chat(prompt, json_mode=True)
+        # Ответ содержит только метаданные (приоритет, сегмент) — деанонимизация не нужна
         return _json.loads(raw)
     except Exception as exc:
         log.warning("AI-анализ клиента не удался: %s", exc)
         return {"priority": "Средний"}
 
 
+async def get_employee_timeman_status(bitrix_user_id: int) -> str:
+    """
+    Возвращает статус рабочего времени сотрудника через Bitrix24 timeman API.
+    Возможные значения: WORK, BREAK, CLOSE, ABSENT, UNKNOWN.
+    """
+    try:
+        result = await b24("timeman.status", {"USER_ID": bitrix_user_id})
+        if not result:
+            return "UNKNOWN"
+        status = result.get("STATUS", "UNKNOWN")
+        return status if status else "UNKNOWN"
+    except Exception as exc:
+        log.warning("Не удалось получить timeman статус для %d: %s", bitrix_user_id, exc)
+        return "UNKNOWN"
+
+
+async def filter_employees_at_work(employees: list[db.Employee]) -> list[db.Employee]:
+    """
+    Возвращает только тех сотрудников, которые сейчас на работе (STATUS = WORK или BREAK).
+    """
+    statuses = await asyncio.gather(
+        *[get_employee_timeman_status(e.bitrix_user_id) for e in employees]
+    )
+    return [e for e, s in zip(employees, statuses) if s in ("WORK", "BREAK")]
+
+
 async def _select_team_for_client(priority: str) -> list[db.Employee]:
     """
     Подбирает группу из 5 ролей для клиента.
-    VIP → самые опытные (наивысший rating), остальные → не обязательно лучшие.
+    В первую очередь выбирает сотрудников, которые находятся на работе (timeman WORK/BREAK).
+    Если никого нет на работе — используется обычный алгоритм по рейтингу.
+    VIP → самые опытные (наивысший rating), остальные → средние.
     """
     all_employees = await db.list_employees()
     if not all_employees:
         return []
 
+    # Получаем набор bitrix_user_id сотрудников, находящихся на работе
+    at_work = await filter_employees_at_work(all_employees)
+    at_work_ids: set[int] = {e.bitrix_user_id for e in at_work}
+    has_anyone_at_work = bool(at_work_ids)
+
     by_role: dict[str, list[db.Employee]] = {}
     for emp in all_employees:
         by_role.setdefault(emp.role, []).append(emp)
 
-    # Сортируем по рейтингу: для VIP — лучших первыми
     is_vip = priority in ("VIP", "Высокий")
 
     team: list[db.Employee] = []
@@ -1158,13 +1218,18 @@ async def _select_team_for_client(priority: str) -> list[db.Employee]:
         if not candidates:
             continue
         candidates.sort(key=lambda e: e.rating, reverse=True)
-        if is_vip:
-            # Берём самого опытного
-            team.append(candidates[0])
+
+        # Если кто-то на работе — берём только из них; иначе — из всех
+        if has_anyone_at_work:
+            pool = [c for c in candidates if c.bitrix_user_id in at_work_ids] or candidates
         else:
-            # Берём наименее загруженного / среднего (последний по рейтингу, но не худший)
-            idx = len(candidates) // 2 if len(candidates) > 2 else 0
-            team.append(candidates[idx])
+            pool = candidates
+
+        if is_vip:
+            team.append(pool[0])
+        else:
+            idx = len(pool) // 2 if len(pool) > 2 else 0
+            team.append(pool[idx])
     return team
 
 
@@ -1197,6 +1262,175 @@ async def _create_card_and_assign_team(
         card.id, priority, [(e.name, e.role) for e in team],
     )
     return card, team
+
+
+# ─────────────────────────────────────────────────────────────────
+# Временный менеджер для недоступного основного
+# ─────────────────────────────────────────────────────────────────
+_TEMP_MANAGER_SYSTEM = """Ты помогаешь выбрать временного замещающего менеджера.
+Тебе дана информация об основном менеджере (роль, опыт, рейтинг) и список доступных сотрудников.
+Выбери ОДНОГО сотрудника для временной замены. Учитывай схожесть опыта и высокий рейтинг.
+Ответь строго JSON: {"selected_bitrix_user_id": <число>, "reason": "<краткое обоснование>"}"""
+
+
+async def _select_temp_manager_via_ai(
+    original_emp: db.Employee,
+    candidates: list[db.Employee],
+) -> Optional[db.Employee]:
+    """
+    ИИ выбирает временного менеджера из списка кандидатов для замены original_emp.
+    Возвращает выбранного сотрудника или None.
+    """
+    import json as _json
+
+    if not candidates:
+        return None
+    if len(candidates) == 1:
+        return candidates[0]
+
+    candidates_text = "\n".join(
+        f"- ID={e.bitrix_user_id}, Имя={e.name}, Роль={e.role}, "
+        f"Рейтинг={e.rating}/10, Опыт: {e.experience_text or 'не указан'}"
+        for e in candidates
+    )
+    prompt = [
+        {"role": "system", "content": _TEMP_MANAGER_SYSTEM},
+        {
+            "role": "user",
+            "content": (
+                f"Основной менеджер (недоступен):\n"
+                f"Имя: {original_emp.name}, Роль: {original_emp.role}, "
+                f"Рейтинг: {original_emp.rating}/10\n"
+                f"Опыт: {original_emp.experience_text or 'не указан'}\n\n"
+                f"Доступные сотрудники для замены:\n{candidates_text}"
+            ),
+        },
+    ]
+    try:
+        raw = await _openrouter_chat(prompt, json_mode=True)
+        data = _json.loads(raw)
+        selected_id = int(data["selected_bitrix_user_id"])
+        for emp in candidates:
+            if emp.bitrix_user_id == selected_id:
+                log.info("ИИ выбрал временного менеджера: %s (%s)", emp.name, data.get("reason", ""))
+                return emp
+    except Exception as exc:
+        log.warning("ИИ не смог выбрать временного менеджера: %s", exc)
+    # Fallback: берём с наивысшим рейтингом
+    return max(candidates, key=lambda e: e.rating)
+
+
+async def _check_manager_availability_for_contact(
+    contact: db.Contact,
+    card: db.ClientCard,
+    dialog_id: str,
+) -> None:
+    """
+    Проверяет доступность назначенных менеджеров (Руководитель, Активный продавец) для контакта.
+    Если основной менеджер в отпуске/на больничном (ABSENT/CLOSE/UNKNOWN):
+      - назначает временного менеджера через ИИ,
+      - добавляет его в чат,
+      - фиксирует замену в БД.
+    Если основной менеджер вернулся:
+      - удаляет временного менеджера из чата,
+      - деактивирует запись о замене.
+    """
+    import json as _json
+
+    if not card.assigned_employees:
+        return
+
+    try:
+        assigned_ids: list[int] = _json.loads(card.assigned_employees)
+    except Exception:
+        return
+
+    # Роли, для которых важна доступность (ключевые менеджеры)
+    key_roles = {"Руководитель", "Активный продавец"}
+
+    chat_id_num = int(dialog_id.replace("chat", ""))
+    all_employees = await db.list_employees()
+    emp_by_id: dict[int, db.Employee] = {e.bitrix_user_id: e for e in all_employees}
+
+    for uid in assigned_ids:
+        emp = emp_by_id.get(uid)
+        if emp is None or emp.role not in key_roles:
+            continue
+
+        status = await get_employee_timeman_status(uid)
+        is_absent = status in ("ABSENT", "CLOSE", "UNKNOWN")
+
+        existing = await db.get_active_temp_assignment(contact.id, uid)
+
+        if is_absent and existing is None:
+            # Менеджер отсутствует, временной замены ещё нет → назначаем
+            at_work = await filter_employees_at_work(all_employees)
+            # Кандидаты: на работе, не уже в чате, не сам менеджер
+            candidates = [
+                e for e in at_work
+                if e.bitrix_user_id not in assigned_ids and e.bitrix_user_id != uid
+            ]
+            if not candidates:
+                # Если никого нет на работе — берём всех, кто не в чате
+                candidates = [
+                    e for e in all_employees
+                    if e.bitrix_user_id not in assigned_ids and e.bitrix_user_id != uid
+                ]
+
+            temp_emp = await _select_temp_manager_via_ai(emp, candidates)
+            if temp_emp is None:
+                log.warning("Не удалось выбрать временного менеджера для %s", emp.name)
+                continue
+
+            # Добавляем временного менеджера в чат
+            try:
+                await b24("im.chat.user.add", {
+                    "CHAT_ID": chat_id_num,
+                    "USERS": [temp_emp.bitrix_user_id],
+                })
+            except Exception as exc:
+                log.warning("Не удалось добавить временного менеджера в чат: %s", exc)
+                continue
+
+            await db.create_temp_assignment(
+                contact_id=contact.id,
+                original_manager_bitrix_id=uid,
+                temp_manager_bitrix_id=temp_emp.bitrix_user_id,
+                dialog_id=dialog_id,
+            )
+            await _bot_send(
+                dialog_id,
+                f"⚠️ Менеджер *{emp.name}* временно недоступен.\n"
+                f"Временно назначен: *{temp_emp.name}* ({temp_emp.role}).",
+            )
+            log.info(
+                "Временный менеджер %s назначен вместо %s для контакта #%d",
+                temp_emp.name, emp.name, contact.id,
+            )
+
+        elif not is_absent and existing is not None:
+            # Основной менеджер вернулся → снимаем временного
+            temp_uid = existing.temp_manager_bitrix_id
+            temp_emp = emp_by_id.get(temp_uid)
+            try:
+                await b24("im.chat.user.delete", {
+                    "CHAT_ID": chat_id_num,
+                    "USER_ID": temp_uid,
+                })
+            except Exception as exc:
+                log.warning("Не удалось удалить временного менеджера из чата: %s", exc)
+
+            await db.deactivate_temp_assignment(existing.id)
+            temp_name = temp_emp.name if temp_emp else f"ID={temp_uid}"
+            await _bot_send(
+                dialog_id,
+                f"✅ Менеджер *{emp.name}* вернулся. "
+                f"Временный менеджер *{temp_name}* удалён из группы.",
+            )
+            log.info(
+                "Основной менеджер %s вернулся, временный %s убран из чата контакта #%d",
+                emp.name, temp_name, contact.id,
+            )
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -1252,6 +1486,135 @@ async def list_team():
         }
         for e in employees
     ]
+
+
+# ─────────────────────────────────────────────────────────────────
+# REST: Временные менеджеры
+# ─────────────────────────────────────────────────────────────────
+class TempManagerAssign(BaseModel):
+    original_manager_bitrix_id: int
+    temp_manager_bitrix_id: int
+
+
+@app.post("/contacts/{contact_id}/temp-manager", status_code=201, tags=["Временные менеджеры"])
+async def assign_temp_manager(contact_id: int, data: TempManagerAssign):
+    """
+    Назначить временного менеджера вместо основного.
+    Добавляет временного менеджера в Bitrix-чат контакта и фиксирует замену в БД.
+    """
+    contact = await db.get_by_id(contact_id)
+    if not contact:
+        return JSONResponse({"error": "Контакт не найден"}, status_code=404)
+    if not contact.bitrix_chat_id:
+        return JSONResponse({"error": "У контакта нет Bitrix-чата"}, status_code=400)
+
+    temp_emp = await db.get_employee_by_bitrix_id(data.temp_manager_bitrix_id)
+    if not temp_emp:
+        return JSONResponse({"error": "Временный менеджер не найден в БД"}, status_code=404)
+
+    chat_id_num = int(contact.bitrix_chat_id.replace("chat", ""))
+    try:
+        await b24("im.chat.user.add", {
+            "CHAT_ID": chat_id_num,
+            "USERS": [data.temp_manager_bitrix_id],
+        })
+    except Exception as exc:
+        return JSONResponse({"error": f"Ошибка Bitrix API: {exc}"}, status_code=502)
+
+    assignment = await db.create_temp_assignment(
+        contact_id=contact_id,
+        original_manager_bitrix_id=data.original_manager_bitrix_id,
+        temp_manager_bitrix_id=data.temp_manager_bitrix_id,
+        dialog_id=contact.bitrix_chat_id,
+    )
+
+    original_emp = await db.get_employee_by_bitrix_id(data.original_manager_bitrix_id)
+    original_name = original_emp.name if original_emp else f"ID={data.original_manager_bitrix_id}"
+    await _bot_send(
+        contact.bitrix_chat_id,
+        f"⚠️ Менеджер *{original_name}* временно недоступен.\n"
+        f"Временно назначен: *{temp_emp.name}* ({temp_emp.role}).",
+    )
+
+    return {
+        "assignment_id": assignment.id,
+        "contact_id": contact_id,
+        "original_manager_bitrix_id": data.original_manager_bitrix_id,
+        "temp_manager_bitrix_id": data.temp_manager_bitrix_id,
+        "dialog_id": contact.bitrix_chat_id,
+    }
+
+
+@app.delete("/contacts/{contact_id}/temp-manager/{assignment_id}", tags=["Временные менеджеры"])
+async def remove_temp_manager(contact_id: int, assignment_id: int):
+    """
+    Снять временного менеджера: удалить из Bitrix-чата и деактивировать замену в БД.
+    """
+    contact = await db.get_by_id(contact_id)
+    if not contact:
+        return JSONResponse({"error": "Контакт не найден"}, status_code=404)
+
+    all_assignments = await db.list_active_temp_assignments()
+    assignment = next(
+        (a for a in all_assignments if a.id == assignment_id and a.contact_id == contact_id),
+        None,
+    )
+    if not assignment:
+        return JSONResponse({"error": "Активная замена не найдена"}, status_code=404)
+
+    chat_id_num = int(assignment.dialog_id.replace("chat", ""))
+    try:
+        await b24("im.chat.user.delete", {
+            "CHAT_ID": chat_id_num,
+            "USER_ID": assignment.temp_manager_bitrix_id,
+        })
+    except Exception as exc:
+        log.warning("Не удалось удалить временного менеджера из чата: %s", exc)
+
+    await db.deactivate_temp_assignment(assignment_id)
+
+    temp_emp = await db.get_employee_by_bitrix_id(assignment.temp_manager_bitrix_id)
+    original_emp = await db.get_employee_by_bitrix_id(assignment.original_manager_bitrix_id)
+    temp_name = temp_emp.name if temp_emp else f"ID={assignment.temp_manager_bitrix_id}"
+    original_name = original_emp.name if original_emp else f"ID={assignment.original_manager_bitrix_id}"
+
+    await _bot_send(
+        assignment.dialog_id,
+        f"✅ Менеджер *{original_name}* вернулся. "
+        f"Временный менеджер *{temp_name}* удалён из группы.",
+    )
+
+    return {"assignment_id": assignment_id, "status": "deactivated"}
+
+
+@app.get("/contacts/{contact_id}/temp-managers", tags=["Временные менеджеры"])
+async def list_contact_temp_managers(contact_id: int):
+    """Список активных временных менеджеров для контакта."""
+    contact = await db.get_by_id(contact_id)
+    if not contact:
+        return JSONResponse({"error": "Контакт не найден"}, status_code=404)
+
+    all_assignments = await db.list_active_temp_assignments()
+    result = []
+    for a in all_assignments:
+        if a.contact_id != contact_id:
+            continue
+        original_emp = await db.get_employee_by_bitrix_id(a.original_manager_bitrix_id)
+        temp_emp = await db.get_employee_by_bitrix_id(a.temp_manager_bitrix_id)
+        result.append({
+            "assignment_id": a.id,
+            "original_manager": {
+                "bitrix_user_id": a.original_manager_bitrix_id,
+                "name": original_emp.name if original_emp else None,
+            },
+            "temp_manager": {
+                "bitrix_user_id": a.temp_manager_bitrix_id,
+                "name": temp_emp.name if temp_emp else None,
+            },
+            "dialog_id": a.dialog_id,
+            "created_at": a.created_at,
+        })
+    return result
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -1624,9 +1987,13 @@ async def get_call_recommendations(data: CallRecommendationsRequest):
             status_code=400,
         )
 
-    content = f"Транскрипт звонка:\n{transcript}"
-    if summary:
-        content = f"Резюме звонка:\n{summary}\n\n{content}"
+    anon = TextAnonymizer()
+    anon_transcript = anon.anonymize(transcript)
+    anon_summary = anon.anonymize(summary) if summary else None
+
+    content = f"Транскрипт звонка:\n{anon_transcript}"
+    if anon_summary:
+        content = f"Резюме звонка:\n{anon_summary}\n\n{content}"
 
     prompt = [
         {"role": "system", "content": _CALL_RECOMMENDATIONS_SYSTEM},
@@ -1635,6 +2002,7 @@ async def get_call_recommendations(data: CallRecommendationsRequest):
 
     try:
         raw = await _openrouter_chat(prompt, json_mode=True)
+        # Ответ содержит только оценки и рекомендации по технике — деанонимизация не нужна
         result = _json.loads(raw)
     except Exception as exc:
         log.error("Ошибка AI-анализа звонка: %s", exc)
@@ -1754,6 +2122,373 @@ async def get_call_detail(call_id: str):
     ]
 
     return result
+
+
+def _extract_price_from_messages(messages: list[dict]) -> Optional[float]:
+    """
+    Ищет в сообщениях чата явно указанную цену/сумму сделки.
+    Сканирует все сообщения на паттерны вида: "5000 BYN", "10 000 руб", "$500", "3 млн" и т.п.
+    Возвращает наибольшую найденную сумму или None если ничего не найдено.
+    """
+    price_patterns = [
+        # "5 000 BYN", "10000 USD", "500 EUR"
+        r"(\d[\d\s]{0,10})\s*(?:BYN|USD|EUR|РУБ|RUB|руб\.?|рублей|доллар\w*|евро)",
+        # "$5000", "€500"
+        r"[$€]\s*(\d[\d\s]{0,10})",
+        # "сумма 5000", "цена 10 000", "стоимость 3000"
+        r"(?:сумм[аеу]|цен[аеу]|стоимост[ьи]|оплат[аеу]|бюджет)\s*[:\-–]?\s*(\d[\d\s]{0,10})",
+        # "5 млн", "3 миллиона"
+        r"(\d+(?:[.,]\d+)?)\s*(?:млн|миллион\w*)",
+        # "500 тысяч", "50к"
+        r"(\d+(?:[.,]\d+)?)\s*(?:тысяч\w*|тыс\.?|к\b)",
+    ]
+    multipliers = {
+        "млн": 1_000_000, "миллион": 1_000_000,
+        "тысяч": 1_000, "тыс": 1_000, "к": 1_000,
+    }
+
+    found: list[float] = []
+    for msg in messages:
+        text = (msg.get("text") or msg.get("TEXT") or "").lower()
+        if not text:
+            continue
+
+        # Специальные: млн / тысячи
+        for pattern in price_patterns[3:]:
+            for m in re.finditer(pattern, text, re.IGNORECASE):
+                try:
+                    val = float(m.group(1).replace(",", ".").replace(" ", ""))
+                    # Определяем множитель по суффиксу
+                    suffix_match = re.search(r"(млн|миллион\w*|тысяч\w*|тыс\.?|\bк\b)", text[m.start():m.start()+30], re.IGNORECASE)
+                    mult = 1
+                    if suffix_match:
+                        for key, mul in multipliers.items():
+                            if suffix_match.group(1).lower().startswith(key):
+                                mult = mul
+                                break
+                    found.append(val * mult)
+                except ValueError:
+                    pass
+
+        # Обычные паттерны с валютой / ключевыми словами
+        for pattern in price_patterns[:3]:
+            for m in re.finditer(pattern, text, re.IGNORECASE):
+                try:
+                    raw = m.group(1).replace(" ", "").replace("\xa0", "")
+                    found.append(float(raw))
+                except ValueError:
+                    pass
+
+    return max(found) if found else None
+
+
+_AI_NEXT_STEP_SYSTEM = """Ты — опытный B2B менеджер по продажам. Тебе дана информация о сделке и переписка с клиентом.
+Определи ОДИН самый важный следующий шаг, который менеджер должен выполнить прямо сейчас, чтобы продвинуть сделку.
+
+Ответь строго JSON:
+{
+  "subject": "Краткое название действия (до 80 символов)",
+  "what_to_do": "Подробное описание: что именно сделать, что сказать/написать, на что обратить внимание. Конкретно и по делу.",
+  "type": "call" | "email" | "meeting",
+  "days_from_now": <через сколько дней выполнить, минимум 1>,
+  "priority": "high" | "medium" | "low"
+}
+"""
+
+
+async def _ai_next_step_activity(
+    card: db.ClientCard,
+    contact_name: str,
+    stage: str,
+    chat_messages: list[dict],
+) -> Optional[dict]:
+    """
+    ИИ определяет следующий обязательный шаг по сделке.
+    Возвращает словарь с полями для crm.activity.add или None при ошибке.
+    """
+    import json as _json
+    import datetime
+
+    recent_texts = []
+    for m in chat_messages[-20:]:
+        text = m.get("text") or m.get("TEXT") or ""
+        if text and len(text) < 500:
+            recent_texts.append(text)
+    chat_excerpt = "\n".join(recent_texts) if recent_texts else "Переписка недоступна"
+
+    context = (
+        f"Клиент: {contact_name}\n"
+        f"Компания: {card.company or '—'}\n"
+        f"Сегмент: {card.segment or '—'}\n"
+        f"Продукт/материал: {card.product_type or '—'}\n"
+        f"Объём: {card.volume or '—'}\n"
+        f"Приоритет: {card.priority}\n"
+        f"Стадия сделки: {stage}\n"
+        f"Заметки ИИ: {card.notes or '—'}\n\n"
+        f"Последние сообщения из переписки:\n{chat_excerpt}"
+    )
+
+    prompt = [
+        {"role": "system", "content": _AI_NEXT_STEP_SYSTEM},
+        {"role": "user", "content": context},
+    ]
+
+    type_map = {"call": 2, "email": 3, "meeting": 1}
+    priority_map = {"high": 2, "medium": 1, "low": 0}
+
+    try:
+        raw = await _openrouter_chat(prompt, json_mode=True)
+        s = _json.loads(raw)
+        days = max(1, int(s.get("days_from_now", 1)))
+        deadline = (datetime.datetime.now() + datetime.timedelta(days=days)).strftime("%Y-%m-%dT10:00:00")
+        return {
+            "SUBJECT": s["subject"],
+            "DESCRIPTION": s.get("what_to_do", ""),
+            "TYPE_ID": type_map.get(s.get("type", "call"), 2),
+            "DEADLINE": deadline,
+            "PRIORITY": priority_map.get(s.get("priority", "high"), 2),
+        }
+    except Exception as exc:
+        log.warning("ИИ не смог определить следующий шаг: %s", exc)
+        return None
+
+
+async def _add_deal_activities(
+    deal_id: int,
+    stage: str,
+    contact_name: str,
+    card: db.ClientCard,
+    chat_messages: list[dict],
+) -> None:
+    """
+    Создаёт запланированные дела для сделки: фиксированные по стадии + дополнительные от ИИ.
+    """
+    import datetime
+
+    now = datetime.datetime.now()
+    tomorrow = (now + datetime.timedelta(days=1)).strftime("%Y-%m-%dT10:00:00")
+    in_3_days = (now + datetime.timedelta(days=3)).strftime("%Y-%m-%dT10:00:00")
+    in_7_days = (now + datetime.timedelta(days=7)).strftime("%Y-%m-%dT10:00:00")
+
+    # TYPE_ID: 2 = Звонок, 1 = Встреча, 3 = Email/задача
+    fixed_activities: list[dict] = []
+
+    if stage == "NEW":
+        fixed_activities = [
+            {
+                "SUBJECT": "Первичный звонок: уточнить потребность",
+                "DESCRIPTION": "Позвонить клиенту, уточнить детали запроса, объём, сроки и бюджет.",
+                "TYPE_ID": 2,
+                "DEADLINE": tomorrow,
+                "PRIORITY": 2,
+            },
+        ]
+    elif stage == "PREPARATION":
+        fixed_activities = [
+            {
+                "SUBJECT": "Отправить коммерческое предложение",
+                "DESCRIPTION": "Подготовить и отправить КП с ценой, объёмом и условиями.",
+                "TYPE_ID": 3,
+                "DEADLINE": tomorrow,
+                "PRIORITY": 2,
+            },
+            {
+                "SUBJECT": "Контрольный звонок: обсудить КП",
+                "DESCRIPTION": "Уточнить, получил ли клиент КП, ответить на вопросы, согласовать условия.",
+                "TYPE_ID": 2,
+                "DEADLINE": in_3_days,
+                "PRIORITY": 1,
+            },
+        ]
+    elif stage == "PREPAYMENT_INVOICE":
+        fixed_activities = [
+            {
+                "SUBJECT": "Выставить счёт на оплату",
+                "DESCRIPTION": "Подготовить и выставить счёт согласно договорённостям.",
+                "TYPE_ID": 3,
+                "DEADLINE": tomorrow,
+                "PRIORITY": 2,
+            },
+            {
+                "SUBJECT": "Проконтролировать поступление оплаты",
+                "DESCRIPTION": "Уточнить статус оплаты, при необходимости напомнить клиенту.",
+                "TYPE_ID": 2,
+                "DEADLINE": in_7_days,
+                "PRIORITY": 1,
+            },
+        ]
+
+    # Обязательное дело от ИИ: следующий шаг, поле "что нужно сделать" = DESCRIPTION
+    ai_activity = await _ai_next_step_activity(card, contact_name, stage, chat_messages)
+    all_activities = fixed_activities + ([ai_activity] if ai_activity else [])
+
+    for act in all_activities:
+        description = f"**{act['SUBJECT']}**\n\n{act['DESCRIPTION']}"
+        try:
+            result = await b24("crm.activity.todo.add", {
+                "ownerTypeId": 2,       # 2 = Сделка
+                "ownerId": deal_id,
+                "description": description,
+                "deadline": act["DEADLINE"],
+                "responsibleId": OPERATOR_USER_ID,
+            })
+            log.info("Дело '%s' создано для сделки #%d: result=%s", act["SUBJECT"], deal_id, result)
+        except Exception as exc:
+            log.error("Не удалось создать дело '%s' для сделки #%d: %s", act["SUBJECT"], deal_id, exc)
+
+
+@app.post("/deals/sync", tags=["CRM Сделки"])
+async def sync_deals_to_bitrix():
+    """
+    Синхронизирует карточки клиентов в CRM-сделки Битрикс24.
+    Для каждого контакта с карточкой создаёт сделку, определяя стадию
+    по приоритету и заполняя все доступные поля.
+    """
+    import json as _json
+
+    cards = await db.list_client_cards()
+    all_contacts = await db.list_all()
+    contacts_map = {c.id: c for c in all_contacts}
+
+    # Получаем историю чатов для анализа стадии
+    results = []
+    for card in cards:
+        contact = contacts_map.get(card.contact_id)
+        if not contact:
+            continue
+
+        # ── Определяем стадию по приоритету и данным ──
+        chat_messages = []
+        if contact.bitrix_chat_id:
+            try:
+                msgs_data = await b24("im.dialog.messages.get", {
+                    "DIALOG_ID": contact.bitrix_chat_id,
+                    "LIMIT": 30,
+                })
+                chat_messages = msgs_data.get("messages", [])
+            except Exception:
+                pass
+
+        has_call = bool(chat_messages and any(
+            "Summary звонка" in (m.get("text", "") or "") or "Транскрипция звонка" in (m.get("text", "") or "")
+            for m in chat_messages
+        ))
+        has_contract_talk = bool(chat_messages and any(
+            "договор" in (m.get("text", "") or "").lower()
+            for m in chat_messages
+        ))
+
+        if card.priority in ("VIP", "Высокий") and has_contract_talk:
+            stage = "PREPAYMENT_INVOICE"
+            probability = 80
+        elif card.priority in ("VIP", "Высокий") or has_call:
+            stage = "PREPARATION"
+            probability = 60
+        elif card.company or card.segment:
+            stage = "PREPARATION"
+            probability = 40
+        else:
+            stage = "NEW"
+            probability = 20
+
+        # ── Формируем название и комментарий ──
+        title_parts = [contact.name]
+        if card.company:
+            title_parts.append(card.company)
+        if card.product_type:
+            title_parts.append(card.product_type)
+        if card.volume:
+            title_parts.append(f"({card.volume})")
+        title = " — ".join(title_parts)
+
+        comment_lines = []
+        if card.segment:
+            comment_lines.append(f"Сегмент: {card.segment}")
+        if card.product_type:
+            comment_lines.append(f"Продукт: {card.product_type}")
+        if card.volume:
+            comment_lines.append(f"Объём: {card.volume}")
+        comment_lines.append(f"Приоритет: {card.priority}")
+        if contact.telegram_username:
+            comment_lines.append(f"Telegram: {contact.telegram_username}")
+        if contact.email:
+            comment_lines.append(f"Email: {contact.email}")
+        if card.notes:
+            comment_lines.append(f"\nПримечания: {card.notes}")
+        comments = "\n".join(comment_lines)
+
+        # ── Извлекаем цену из истории чата ──
+        opportunity = _extract_price_from_messages(chat_messages)
+        if opportunity is None:
+            opportunity = 0
+
+        # ── Ищем / создаём CRM-контакт ──
+        crm_contact_id = None
+        try:
+            existing = await b24("crm.contact.list", {
+                "filter": {"NAME": contact.name.split()[0] if contact.name else contact.name},
+                "select": ["ID", "NAME"],
+            })
+            if existing:
+                crm_contact_id = int(existing[0]["ID"])
+        except Exception:
+            pass
+
+        if not crm_contact_id:
+            try:
+                name_parts = contact.name.split(maxsplit=1)
+                crm_contact_id = await b24("crm.contact.add", {
+                    "fields": {
+                        "NAME": name_parts[0],
+                        "LAST_NAME": name_parts[1] if len(name_parts) > 1 else "",
+                        "TYPE_ID": "CLIENT",
+                        "SOURCE_ID": "SELF",
+                        "OPENED": "Y",
+                        "COMMENTS": f"Telegram: {contact.telegram_username or contact.telegram_id}",
+                    }
+                })
+            except Exception as exc:
+                log.warning("Не удалось создать CRM-контакт для %s: %s", contact.name, exc)
+
+        # ── Создаём сделку ──
+        deal_fields = {
+            "TITLE": title,
+            "STAGE_ID": stage,
+            "OPPORTUNITY": opportunity,
+            "CURRENCY_ID": "BYN",
+            "PROBABILITY": probability,
+            "SOURCE_ID": "SELF",
+            "TYPE_ID": "SALE",
+            "COMMENTS": comments,
+            "BEGINDATE": card.created_at[:10] if card.created_at else "",
+            "ASSIGNED_BY_ID": OPERATOR_USER_ID,
+        }
+        if crm_contact_id:
+            deal_fields["CONTACT_ID"] = crm_contact_id
+
+        try:
+            deal_id = await b24("crm.deal.add", {
+                "fields": deal_fields,
+                "params": {"REGISTER_SONET_EVENT": "Y"},
+            })
+            log.info("Сделка #%s создана для %s (стадия: %s, сумма: %s)", deal_id, contact.name, stage, opportunity)
+            await _add_deal_activities(int(deal_id), stage, contact.name, card, chat_messages)
+            results.append({
+                "deal_id": deal_id,
+                "contact": contact.name,
+                "title": title,
+                "stage": stage,
+                "probability": probability,
+                "opportunity": opportunity,
+            })
+        except Exception as exc:
+            log.error("Ошибка создания сделки для %s: %s", contact.name, exc)
+            results.append({
+                "contact": contact.name,
+                "error": str(exc),
+            })
+
+    return {"status": "ok", "deals": results}
 
 
 @app.get("/health", tags=["Система"])

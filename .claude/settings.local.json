@@ -24,7 +24,16 @@
       "Bash(git:*)",
       "Bash(cp:*)",
       "Bash(uv sync:*)",
-      "Bash(wc -l /Users/mitkovanton/Workspace/hackathon-flex/*.py /Users/mitkovanton/Workspace/hackathon-flex/phone_recording/*.py)"
+      "Bash(wc -l /Users/mitkovanton/Workspace/hackathon-flex/*.py /Users/mitkovanton/Workspace/hackathon-flex/phone_recording/*.py)",
+      "Bash(ls:*)",
+      "Bash(sqlite3 /Users/mitkovanton/Workspace/hackathon-flex/contacts.db \".schema\")",
+      "Bash(sqlite3 /Users/mitkovanton/Workspace/hackathon-flex/contacts.db \"SELECT COUNT\\(*\\) as contacts_count FROM contacts;\")",
+      "Bash(sqlite3:*)",
+      "Bash(source /Users/mitkovanton/Workspace/hackathon-flex/.env)",
+      "Bash(for chat_id in 92 94 96)",
+      "Bash(do echo:*)",
+      "Bash(/dev/null done:*)",
+      "Bash(find /Users/mitkovanton/Workspace/hackathon-flex -not -path *.venv* -not -path *__pycache__* -not -path .git/* -type f)"
     ]
   }
 }

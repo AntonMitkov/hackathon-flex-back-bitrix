@@ -71,6 +71,17 @@ class ClientCard:
     created_at: Optional[str]
 
 
+@dataclass
+class TempManagerAssignment:
+    id: int
+    contact_id: int
+    original_manager_bitrix_id: int
+    temp_manager_bitrix_id: int
+    dialog_id: str
+    is_active: int  # 1 = активно, 0 = завершено
+    created_at: Optional[str]
+
+
 def _row_to_contact(row: aiosqlite.Row) -> Contact:
     return Contact(
         id=row["id"],
@@ -119,6 +130,18 @@ def _row_to_client_card(row: aiosqlite.Row) -> ClientCard:
         priority=row["priority"],
         notes=row["notes"],
         assigned_employees=row["assigned_employees"],
+        created_at=row["created_at"],
+    )
+
+
+def _row_to_temp_assignment(row: aiosqlite.Row) -> TempManagerAssignment:
+    return TempManagerAssignment(
+        id=row["id"],
+        contact_id=row["contact_id"],
+        original_manager_bitrix_id=row["original_manager_bitrix_id"],
+        temp_manager_bitrix_id=row["temp_manager_bitrix_id"],
+        dialog_id=row["dialog_id"],
+        is_active=row["is_active"],
         created_at=row["created_at"],
     )
 
@@ -189,6 +212,17 @@ async def init_db() -> None:
                 call_db_id  INTEGER NOT NULL REFERENCES calls(id),
                 contact_id  INTEGER NOT NULL REFERENCES contacts(id),
                 UNIQUE(call_db_id, contact_id)
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS temp_manager_assignments (
+                id                          INTEGER PRIMARY KEY AUTOINCREMENT,
+                contact_id                  INTEGER NOT NULL REFERENCES contacts(id),
+                original_manager_bitrix_id  INTEGER NOT NULL,
+                temp_manager_bitrix_id      INTEGER NOT NULL,
+                dialog_id                   TEXT NOT NULL,
+                is_active                   INTEGER NOT NULL DEFAULT 1,
+                created_at                  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
         await db.commit()
@@ -617,3 +651,62 @@ async def get_call_participants(call_db_id: int) -> list[Contact]:
         ) as cur:
             rows = await cur.fetchall()
     return [_row_to_contact(r) for r in rows]
+
+
+# ─────────────────────────────────────────────────────────────────
+# Временные замены менеджеров
+# ─────────────────────────────────────────────────────────────────
+async def create_temp_assignment(
+    contact_id: int,
+    original_manager_bitrix_id: int,
+    temp_manager_bitrix_id: int,
+    dialog_id: str,
+) -> TempManagerAssignment:
+    async with aiosqlite.connect(DB_PATH) as conn:
+        conn.row_factory = aiosqlite.Row
+        await conn.execute(
+            """INSERT INTO temp_manager_assignments
+               (contact_id, original_manager_bitrix_id, temp_manager_bitrix_id, dialog_id)
+               VALUES (?,?,?,?)""",
+            (contact_id, original_manager_bitrix_id, temp_manager_bitrix_id, dialog_id),
+        )
+        await conn.commit()
+        async with conn.execute(
+            "SELECT * FROM temp_manager_assignments WHERE id = last_insert_rowid()"
+        ) as cur:
+            return _row_to_temp_assignment(await cur.fetchone())
+
+
+async def get_active_temp_assignment(
+    contact_id: int,
+    original_manager_bitrix_id: int,
+) -> Optional[TempManagerAssignment]:
+    async with aiosqlite.connect(DB_PATH) as conn:
+        conn.row_factory = aiosqlite.Row
+        async with conn.execute(
+            """SELECT * FROM temp_manager_assignments
+               WHERE contact_id=? AND original_manager_bitrix_id=? AND is_active=1
+               ORDER BY created_at DESC LIMIT 1""",
+            (contact_id, original_manager_bitrix_id),
+        ) as cur:
+            row = await cur.fetchone()
+    return _row_to_temp_assignment(row) if row else None
+
+
+async def list_active_temp_assignments() -> list[TempManagerAssignment]:
+    async with aiosqlite.connect(DB_PATH) as conn:
+        conn.row_factory = aiosqlite.Row
+        async with conn.execute(
+            "SELECT * FROM temp_manager_assignments WHERE is_active=1 ORDER BY created_at DESC"
+        ) as cur:
+            rows = await cur.fetchall()
+    return [_row_to_temp_assignment(r) for r in rows]
+
+
+async def deactivate_temp_assignment(assignment_id: int) -> None:
+    async with aiosqlite.connect(DB_PATH) as conn:
+        await conn.execute(
+            "UPDATE temp_manager_assignments SET is_active=0 WHERE id=?",
+            (assignment_id,),
+        )
+        await conn.commit()

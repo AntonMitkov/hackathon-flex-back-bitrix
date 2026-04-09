@@ -1,7 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import sys
+from pathlib import Path
 from openai import APIStatusError, AsyncOpenAI
+
+# Импортируем anonymizer из корня проекта
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from anonymizer import TextAnonymizer
 
 
 SYSTEM_PROMPT = (
@@ -35,14 +41,20 @@ class OpenRouterSummarizer:
         )
 
     async def summarize(self, transcript_text: str, title: str) -> str:
-        if len(transcript_text) > 120_000:
-            return await self._summarize_large_transcript(transcript_text, title)
+        anon = TextAnonymizer()
+        anon_title = anon.anonymize(title)
+        anon_transcript = anon.anonymize(transcript_text)
 
-        return await self._request_summary(
-            transcript_text=transcript_text,
-            title=title,
-            prompt_prefix=f"Название звонка: {title}\n\nТранскрипт:\n",
-        )
+        if len(anon_transcript) > 120_000:
+            raw_summary = await self._summarize_large_transcript(anon_transcript, anon_title)
+        else:
+            raw_summary = await self._request_summary(
+                transcript_text=anon_transcript,
+                title=anon_title,
+                prompt_prefix=f"Название звонка: {anon_title}\n\nТранскрипт:\n",
+            )
+
+        return anon.deanonymize(raw_summary)
 
     async def _summarize_large_transcript(self, transcript_text: str, title: str) -> str:
         chunk_size = 60_000
