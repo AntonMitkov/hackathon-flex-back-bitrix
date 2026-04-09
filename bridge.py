@@ -512,6 +512,14 @@ app = FastAPI(
     ),
     version="1.0.0",
     lifespan=lifespan,
+    openapi_tags=[
+        {"name": "Звонки", "description": "Приём, хранение и анализ телефонных звонков"},
+        {"name": "Контакты", "description": "Управление контактами клиентов"},
+        {"name": "Сотрудники", "description": "Управление сотрудниками и командами"},
+        {"name": "Карточки клиентов", "description": "Карточки клиентов с приоритетами и назначениями"},
+        {"name": "Вебхуки", "description": "Приём событий от Битрикс24"},
+        {"name": "Система", "description": "Статус сервиса"},
+    ],
 )
 
 
@@ -545,7 +553,7 @@ _HANDLED_EVENTS = {"ONIMBOTMESSAGEADD", "ONIMMESSAGEADD", "ONIMBOTV2MESSAGEADD"}
 
 
 # ── Вебхук событий Битрикс24 ─────────────────────────────────────
-@app.post("/event")
+@app.post("/event", tags=["Вебхуки"])
 async def handle_bitrix_event(request: Request):
     """
     Принимает события от Битрикс24 (Bot Platform + исходящий вебхук).
@@ -706,7 +714,7 @@ async def handle_bitrix_event(request: Request):
     return JSONResponse({"status": "ok"})
 
 
-@app.post("/debug/event")
+@app.post("/debug/event", tags=["Вебхуки"])
 async def debug_event(request: Request):
     """Диагностический эндпоинт: логирует всё что пришло от Битрикс24."""
     content_type = request.headers.get("content-type", "")
@@ -735,7 +743,7 @@ class LinkChannel(BaseModel):
     telegram_username: Optional[str] = None
 
 
-@app.post("/contacts", status_code=201)
+@app.post("/contacts", status_code=201, tags=["Контакты"])
 async def register_contact(data: ContactCreate):
     """
     Зарегистрировать или обновить контакт.
@@ -763,7 +771,7 @@ async def register_contact(data: ContactCreate):
     }
 
 
-@app.post("/contacts/{contact_id}/link")
+@app.post("/contacts/{contact_id}/link", tags=["Контакты"])
 async def link_channel_to_contact(contact_id: int, data: LinkChannel):
     """
     Привязать email и/или telegram к существующему контакту.
@@ -797,7 +805,7 @@ async def link_channel_to_contact(contact_id: int, data: LinkChannel):
     }
 
 
-@app.get("/contacts")
+@app.get("/contacts", tags=["Контакты"])
 async def list_contacts():
     """Список всех зарегистрированных контактов."""
     contacts = await db.list_all()
@@ -814,7 +822,7 @@ async def list_contacts():
     ]
 
 
-@app.delete("/contacts")
+@app.delete("/contacts", tags=["Контакты"])
 async def clear_contacts():
     """Удалить все контакты из базы данных."""
     import aiosqlite
@@ -824,7 +832,7 @@ async def clear_contacts():
     return {"status": "ok", "message": "Все контакты удалены"}
 
 
-@app.get("/employees")
+@app.get("/employees", tags=["Сотрудники"])
 async def list_employees():
     """Получить всех активных сотрудников из Битрикс24 (с обновлением кэша)."""
     global _employees
@@ -970,7 +978,7 @@ def _format_summary(data: dict, contact_name: str) -> str:
 
 
 # ── Эндпоинт: Summary переписки ──────────────────────────────────
-@app.post("/contacts/{contact_id}/summary")
+@app.post("/contacts/{contact_id}/summary", tags=["Контакты"])
 async def generate_summary(contact_id: int):
     """
     Генерирует CLIENT SUMMARY по переписке с контактом.
@@ -1016,7 +1024,7 @@ async def generate_summary(contact_id: int):
 
 
 # ── Эндпоинт: Pre-call Brief ─────────────────────────────────────
-@app.post("/contacts/{contact_id}/brief")
+@app.post("/contacts/{contact_id}/brief", tags=["Контакты"])
 async def generate_brief(contact_id: int):
     """
     Генерирует AI-бриф для подготовки к звонку с клиентом.
@@ -1202,7 +1210,7 @@ class EmployeeCreate(BaseModel):
     rating: int = 5
 
 
-@app.post("/employees/register", status_code=201)
+@app.post("/employees/register", status_code=201, tags=["Сотрудники"])
 async def register_employee(data: EmployeeCreate):
     """Зарегистрировать или обновить сотрудника с описанием опыта."""
     if data.role not in db.VALID_ROLES:
@@ -1229,7 +1237,7 @@ async def register_employee(data: EmployeeCreate):
     }
 
 
-@app.get("/employees/team")
+@app.get("/employees/team", tags=["Сотрудники"])
 async def list_team():
     """Список всех зарегистрированных сотрудников отдела продаж."""
     employees = await db.list_employees()
@@ -1249,7 +1257,7 @@ async def list_team():
 # ─────────────────────────────────────────────────────────────────
 # REST: Карточки клиентов
 # ─────────────────────────────────────────────────────────────────
-@app.get("/client-cards")
+@app.get("/client-cards", tags=["Карточки клиентов"])
 async def list_cards():
     """Список всех карточек клиентов."""
     cards = await db.list_client_cards()
@@ -1270,7 +1278,7 @@ async def list_cards():
     ]
 
 
-@app.get("/client-cards/{card_id}")
+@app.get("/client-cards/{card_id}", tags=["Карточки клиентов"])
 async def get_card(card_id: int):
     """Получить карточку клиента по ID."""
     card = await db.get_client_card(card_id)
@@ -1290,7 +1298,7 @@ async def get_card(card_id: int):
     }
 
 
-@app.get("/contacts/{contact_id}/card")
+@app.get("/contacts/{contact_id}/card", tags=["Контакты"])
 async def get_contact_card(contact_id: int):
     """Получить карточку клиента по ID контакта."""
     card = await db.get_card_by_contact(contact_id)
@@ -1322,6 +1330,19 @@ class CallSummaryRequest(BaseModel):
     started_at: str | None = None
     finished_at: str | None = None
     participants: list[str] | None = None  # имена участников звонка
+    participant_telegram_ids: list[int] | None = None  # Telegram user IDs участников
+
+
+def _format_call_time(iso_string: str) -> str:
+    """Конвертирует ISO datetime в читаемый формат UTC+3 (Москва/Минск)."""
+    from datetime import datetime, timezone, timedelta
+    try:
+        dt = datetime.fromisoformat(iso_string)
+        utc3 = timezone(timedelta(hours=3))
+        dt_local = dt.astimezone(utc3)
+        return dt_local.strftime("%d.%m.%Y %H:%M")
+    except Exception:
+        return iso_string
 
 
 async def _find_contact_for_call(
@@ -1362,127 +1383,380 @@ async def _find_contact_for_call(
     return None
 
 
-@app.post("/call-summary")
+@app.post("/call-summary", tags=["Звонки"])
 async def receive_call_summary(data: CallSummaryRequest):
     """
     Принимает summary звонка от сервиса phone_recording.
-    Находит контакт и отправляет summary в его Битрикс-чат.
-    Если контакта нет — создаёт нового + карточку + чат.
+    По Telegram ID участников находит их контакты и отправляет summary
+    в Битрикс-чат каждого участника. Если контакта нет — создаёт.
     """
+    print(f"\n{'='*60}")
+    print(f"[CALL-SUMMARY] Получен summary звонка")
+    print(f"[CALL-SUMMARY] call_id={data.call_id}")
+    print(f"[CALL-SUMMARY] chat_title={data.chat_title}")
+    print(f"[CALL-SUMMARY] participants={data.participants}")
+    print(f"[CALL-SUMMARY] participant_telegram_ids={data.participant_telegram_ids}")
+    print(f"{'='*60}\n")
+
     log.info(
-        "Получен summary звонка: call_id=%s, chat=%s, participants=%s",
-        data.call_id, data.chat_title, data.participants,
+        "Получен summary звонка: call_id=%s, chat=%s, participants=%s, tg_ids=%s",
+        data.call_id, data.chat_title, data.participants, data.participant_telegram_ids,
     )
 
-    # ── 1. Ищем контакт ──
-    contact = await _find_contact_for_call(data.chat_title, data.participants)
+    # ── 1. Собираем контакты участников по Telegram ID ──
+    contacts: list[db.Contact] = []
 
-    if contact is None:
-        # Создаём нового контакта по данным звонка
+    if data.participant_telegram_ids:
+        for tg_id in data.participant_telegram_ids:
+            print(f"[CALL-SUMMARY] Ищем контакт по Telegram ID: {tg_id}")
+            contact = await db.get_by_telegram(str(tg_id))
+            if contact:
+                contacts.append(contact)
+                print(f"[CALL-SUMMARY] ✓ Найден: {contact.name} (ID={contact.id}, bitrix_chat={contact.bitrix_chat_id})")
+                log.info("Найден контакт по Telegram ID %s: %s (ID=%d)", tg_id, contact.name, contact.id)
+            else:
+                print(f"[CALL-SUMMARY] ✗ Контакт с Telegram ID {tg_id} НЕ найден в БД")
+
+    # Если по Telegram ID никого не нашли — пробуем старый путь (имена/title)
+    if not contacts:
+        contact = await _find_contact_for_call(data.chat_title, data.participants)
+        if contact:
+            contacts.append(contact)
+
+    # Если вообще ничего не нашли — создаём нового контакта
+    if not contacts:
         client_name = data.chat_title.strip()
         if data.participants:
-            # Берём первого участника, который не сотрудник
             employee_names = {e["name"].lower() for e in _employees.values()} if _employees else set()
             for p in data.participants:
                 if p.lower().strip() not in employee_names:
                     client_name = p.strip()
                     break
 
-        contact = await db.upsert_contact(name=client_name)
+        # Если есть telegram_id, привязываем его к контакту
+        tg_id_str = str(data.participant_telegram_ids[0]) if data.participant_telegram_ids else None
+        contact = await db.upsert_contact(name=client_name, telegram_id=tg_id_str)
+        contacts.append(contact)
         log.info("Создан контакт из звонка: %s (ID=%d)", client_name, contact.id)
 
-    # ── 2. Получить или создать Битрикс-чат ──
-    dialog_id = contact.bitrix_chat_id
+    # ── 2. Сохраняем звонок в БД ──
+    import json as _json
+    tg_ids_json = _json.dumps(data.participant_telegram_ids) if data.participant_telegram_ids else None
+    call_record = await db.create_call(
+        call_id=data.call_id,
+        chat_title=data.chat_title,
+        started_at=data.started_at,
+        finished_at=data.finished_at,
+        transcript_text=data.transcript_text,
+        summary_text=data.summary_markdown,
+        participant_telegram_ids=tg_ids_json,
+    )
+    # Привязываем участников
+    for contact in contacts:
+        await db.add_call_participant(call_record.id, contact.id)
+    print(f"[CALL-SUMMARY] Звонок сохранён в БД: id={call_record.id}, call_id={call_record.call_id}")
 
-    if not dialog_id:
-        # Создаём карточку на основе summary звонка
-        card, team = await _create_card_and_assign_team(contact, data.summary_markdown)
-
-        if team:
-            chat_user_ids = [e.bitrix_user_id for e in team]
-            priority_label = card.priority
-        else:
-            chat_user_ids = None
-            priority_label = "Средний"
-
-        priority_emoji = {"VIP": "🔥", "Высокий": "🟠", "Средний": "🟡", "Низкий": "🟢"}.get(priority_label, "⚪")
-        title = f"{priority_emoji} {contact.name} [{priority_label}]"
-        dialog_id = await _create_bitrix_chat(title, chat_user_ids)
-        await db.set_chat(contact.id, dialog_id)
-
-        # Шапка чата
-        lines = [f"👤 *Контакт: {contact.name}*"]
-        if contact.telegram_id:
-            lines.append(f"✈️ Telegram: {contact.telegram_username or contact.telegram_id}")
-        if contact.email:
-            lines.append(f"📧 Email: {contact.email}")
-        lines.append("")
-        lines.append(f"📋 *Карточка клиента #{card.id}*")
-        lines.append(f"Приоритет: {priority_emoji} {card.priority}")
-        if card.company:
-            lines.append(f"Компания: {card.company}")
-        if card.segment:
-            lines.append(f"Сегмент: {card.segment}")
-        if team:
-            lines.append("")
-            lines.append("👥 *Назначенная команда:*")
-            for emp in team:
-                lines.append(f"  • {emp.name} — {emp.role} (рейтинг: {emp.rating}/10)")
-
-        await _bot_send(dialog_id, "\n".join(lines))
-
-        # Описание чата
-        chat_id_num = dialog_id.replace("chat", "")
-        desc_lines = [f"Приоритет: {priority_emoji} {card.priority}"]
-        if card.company:
-            desc_lines.append(f"Компания: {card.company}")
-        if team:
-            desc_lines.append("Команда: " + ", ".join(f"{e.name} ({e.role})" for e in team))
-        try:
-            await b24("im.chat.update", {
-                "CHAT_ID": int(chat_id_num),
-                "DESCRIPTION": "\n".join(desc_lines),
-            })
-        except Exception:
-            pass
-
-        log.info("Создан чат %s для контакта %s из звонка", dialog_id, contact.name)
-
-    # ── 3. Отправляем summary в чат ──
+    # ── 3. Формируем сообщение ──
     time_info = ""
     if data.started_at:
-        time_info = f"\n🕐 Начало: {data.started_at}"
+        time_info = f"\nНачало: {_format_call_time(data.started_at)}"
     if data.finished_at:
-        time_info += f"\n🕐 Окончание: {data.finished_at}"
+        time_info += f"\nОкончание: {_format_call_time(data.finished_at)}"
 
     summary_message = (
-        f"📞 *Summary звонка*{time_info}\n"
-        f"call_id: {data.call_id}\n\n"
+        f"Резюме звонка{time_info}\n\n"
         f"{data.summary_markdown}"
     )
-    await _bot_send(dialog_id, summary_message)
 
-    # Если есть транскрипция — отправляем отдельным сообщением (укороченно)
+    transcript_message = None
     if data.transcript_text:
         transcript_preview = data.transcript_text[:3000]
         if len(data.transcript_text) > 3000:
             transcript_preview += "\n\n... (транскрипция обрезана)"
-        await _bot_send(dialog_id, f"📝 *Транскрипция звонка:*\n\n{transcript_preview}")
+        transcript_message = f"Транскрипция звонка:\n\n{transcript_preview}"
 
-    log.info(
-        "Summary звонка %s отправлен в чат %s контакта %s",
-        data.call_id, dialog_id, contact.name,
-    )
+    # ── 4. Отправляем summary в чат каждого участника ──
+    results = []
+    for contact in contacts:
+        dialog_id = contact.bitrix_chat_id
+
+        if not dialog_id:
+            # Создаём карточку и чат для этого контакта
+            card, team = await _create_card_and_assign_team(contact, data.summary_markdown)
+
+            if team:
+                chat_user_ids = [e.bitrix_user_id for e in team]
+                priority_label = card.priority
+            else:
+                chat_user_ids = None
+                priority_label = "Средний"
+
+            priority_emoji = {"VIP": "🔥", "Высокий": "🟠", "Средний": "🟡", "Низкий": "🟢"}.get(priority_label, "⚪")
+            title = f"{priority_emoji} {contact.name} [{priority_label}]"
+            dialog_id = await _create_bitrix_chat(title, chat_user_ids)
+            await db.set_chat(contact.id, dialog_id)
+
+            # Шапка чата
+            lines = [f"👤 *Контакт: {contact.name}*"]
+            if contact.telegram_id:
+                lines.append(f"✈️ Telegram: {contact.telegram_username or contact.telegram_id}")
+            if contact.email:
+                lines.append(f"📧 Email: {contact.email}")
+            lines.append("")
+            lines.append(f"📋 *Карточка клиента #{card.id}*")
+            lines.append(f"Приоритет: {priority_emoji} {card.priority}")
+            if card.company:
+                lines.append(f"Компания: {card.company}")
+            if card.segment:
+                lines.append(f"Сегмент: {card.segment}")
+            if team:
+                lines.append("")
+                lines.append("👥 *Назначенная команда:*")
+                for emp in team:
+                    lines.append(f"  • {emp.name} — {emp.role} (рейтинг: {emp.rating}/10)")
+
+            await _bot_send(dialog_id, "\n".join(lines))
+
+            # Описание чата
+            chat_id_num = dialog_id.replace("chat", "")
+            desc_lines = [f"Приоритет: {priority_emoji} {card.priority}"]
+            if card.company:
+                desc_lines.append(f"Компания: {card.company}")
+            if team:
+                desc_lines.append("Команда: " + ", ".join(f"{e.name} ({e.role})" for e in team))
+            try:
+                await b24("im.chat.update", {
+                    "CHAT_ID": int(chat_id_num),
+                    "DESCRIPTION": "\n".join(desc_lines),
+                })
+            except Exception:
+                pass
+
+            log.info("Создан чат %s для контакта %s из звонка", dialog_id, contact.name)
+
+        # Отправляем summary
+        print(f"[CALL-SUMMARY] → Отправляем summary в Битрикс чат {dialog_id} контакта {contact.name}")
+        await _bot_send(dialog_id, summary_message)
+        if transcript_message:
+            await _bot_send(dialog_id, transcript_message)
+        print(f"[CALL-SUMMARY] ✓ Summary отправлен в {dialog_id}")
+
+        log.info(
+            "Summary звонка %s отправлен в чат %s контакта %s",
+            data.call_id, dialog_id, contact.name,
+        )
+        results.append({
+            "contact_id": contact.id,
+            "contact_name": contact.name,
+            "bitrix_chat_id": dialog_id,
+        })
 
     return {
         "status": "ok",
-        "contact_id": contact.id,
-        "contact_name": contact.name,
-        "bitrix_chat_id": dialog_id,
+        "delivered_to": results,
     }
 
 
-@app.get("/health")
+# ─────────────────────────────────────────────────────────────────
+# Рекомендации по улучшению звонка (AI)
+# ─────────────────────────────────────────────────────────────────
+_CALL_RECOMMENDATIONS_SYSTEM = """\
+Ты — опытный тренер по продажам и деловым переговорам.
+Проанализируй транскрипт звонка и верни JSON строго в следующем формате:
+{
+  "rating": число от 1 до 10 (общая оценка качества звонка),
+  "explanation": "общее пояснение оценки — что было хорошо и что плохо (2-4 предложения)",
+  "errors": [
+    {
+      "type": "тип ошибки (напр. 'Перебивание', 'Нет резюмирования', 'Слабое закрытие')",
+      "description": "подробное описание ошибки",
+      "recommendation": "конкретная рекомендация как исправить"
+    }
+  ]
+}
+
+Критерии оценки:
+- Чёткость и структура разговора
+- Активное слушание (не перебивали ли собеседника)
+- Выявление потребностей клиента
+- Презентация решения / ответы на вопросы
+- Работа с возражениями
+- Резюмирование договорённостей и следующие шаги
+- Вежливость и профессионализм
+- Управление временем звонка\
+"""
+
+
+class CallRecommendationsRequest(BaseModel):
+    call_id: str | None = None
+    transcript_text: str | None = None
+    summary_markdown: str | None = None
+
+
+@app.post("/call-recommendations", tags=["Звонки"])
+async def get_call_recommendations(data: CallRecommendationsRequest):
+    """
+    Анализирует звонок и возвращает рекомендации:
+    оценку, пояснение и список ошибок с рекомендациями.
+    Если передан call_id без transcript_text — берёт данные из БД.
+    Результат сохраняется в БД.
+    """
+    import json as _json
+
+    transcript = data.transcript_text
+    summary = data.summary_markdown
+
+    # Если передан call_id — пробуем взять данные из БД
+    if data.call_id and not transcript:
+        call_record = await db.get_call_by_call_id(data.call_id)
+        if call_record:
+            transcript = call_record.transcript_text
+            summary = summary or call_record.summary_text
+        if not transcript:
+            return JSONResponse(
+                {"error": "Транскрипция не найдена. Передайте transcript_text или корректный call_id."},
+                status_code=400,
+            )
+
+    if not transcript:
+        return JSONResponse(
+            {"error": "Необходимо передать transcript_text или call_id."},
+            status_code=400,
+        )
+
+    content = f"Транскрипт звонка:\n{transcript}"
+    if summary:
+        content = f"Резюме звонка:\n{summary}\n\n{content}"
+
+    prompt = [
+        {"role": "system", "content": _CALL_RECOMMENDATIONS_SYSTEM},
+        {"role": "user", "content": content},
+    ]
+
+    try:
+        raw = await _openrouter_chat(prompt, json_mode=True)
+        result = _json.loads(raw)
+    except Exception as exc:
+        log.error("Ошибка AI-анализа звонка: %s", exc)
+        return JSONResponse(
+            {"error": "Не удалось проанализировать звонок", "details": str(exc)},
+            status_code=500,
+        )
+
+    # Нормализуем rating в диапазон 1-10
+    rating = result.get("rating")
+    if isinstance(rating, (int, float)):
+        result["rating"] = max(1, min(10, int(rating)))
+
+    # Сохраняем AI review в БД
+    if data.call_id:
+        await db.update_call(data.call_id, ai_review=_json.dumps(result, ensure_ascii=False))
+        log.info("AI review сохранён для звонка %s", data.call_id)
+
+    log.info(
+        "Рекомендации по звонку %s: rating=%s, errors=%d",
+        data.call_id or "?", result.get("rating"), len(result.get("errors", [])),
+    )
+
+    return result
+
+
+# ─────────────────────────────────────────────────────────────────
+# REST: Звонки
+# ─────────────────────────────────────────────────────────────────
+def _call_to_dict(call: db.Call) -> dict:
+    import json as _json
+    result = {
+        "id": call.id,
+        "call_id": call.call_id,
+        "chat_title": call.chat_title,
+        "started_at": call.started_at,
+        "finished_at": call.finished_at,
+        "has_transcript": bool(call.transcript_text),
+        "has_summary": bool(call.summary_text),
+        "has_ai_review": bool(call.ai_review),
+        "created_at": call.created_at,
+    }
+    if call.started_at:
+        result["started_at_formatted"] = _format_call_time(call.started_at)
+    if call.finished_at:
+        result["finished_at_formatted"] = _format_call_time(call.finished_at)
+    if call.participant_telegram_ids:
+        try:
+            result["participant_telegram_ids"] = _json.loads(call.participant_telegram_ids)
+        except Exception:
+            result["participant_telegram_ids"] = []
+    return result
+
+
+def _call_to_detail_dict(call: db.Call) -> dict:
+    import json as _json
+    result = _call_to_dict(call)
+    result["transcript_text"] = call.transcript_text
+    result["summary_text"] = call.summary_text
+    if call.ai_review:
+        try:
+            result["ai_review"] = _json.loads(call.ai_review)
+        except Exception:
+            result["ai_review"] = call.ai_review
+    else:
+        result["ai_review"] = None
+    return result
+
+
+@app.get("/calls", tags=["Звонки"])
+async def list_calls():
+    """Список всех звонков."""
+    calls = await db.list_calls()
+    return [_call_to_dict(c) for c in calls]
+
+
+@app.get("/calls/contact/{contact_id}", tags=["Звонки"])
+async def list_calls_by_contact(contact_id: int):
+    """Все звонки с определённым контактом."""
+    contact = await db.get_by_id(contact_id)
+    if not contact:
+        return JSONResponse({"error": "Контакт не найден"}, status_code=404)
+    calls = await db.get_calls_by_contact(contact_id)
+    return {
+        "contact": {
+            "id": contact.id,
+            "name": contact.name,
+            "telegram_id": contact.telegram_id,
+        },
+        "calls": [_call_to_dict(c) for c in calls],
+    }
+
+
+@app.get("/calls/{call_id}", tags=["Звонки"])
+async def get_call_detail(call_id: str):
+    """Подробная информация по конкретному звонку (включая транскрипцию, резюме, AI review)."""
+    # Пробуем найти по внешнему call_id
+    call = await db.get_call_by_call_id(call_id)
+    # Если не нашли — пробуем как числовой id из БД
+    if not call and call_id.isdigit():
+        call = await db.get_call_by_id(int(call_id))
+    if not call:
+        return JSONResponse({"error": "Звонок не найден"}, status_code=404)
+
+    result = _call_to_detail_dict(call)
+
+    # Добавляем участников
+    participants = await db.get_call_participants(call.id)
+    result["participants"] = [
+        {
+            "id": c.id,
+            "name": c.name,
+            "telegram_id": c.telegram_id,
+            "telegram_username": c.telegram_username,
+        }
+        for c in participants
+    ]
+
+    return result
+
+
+@app.get("/health", tags=["Система"])
 async def health():
     return {"status": "ok", "bot_id": _bot_id}
 

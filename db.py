@@ -37,6 +37,27 @@ class Employee:
 
 
 @dataclass
+class Call:
+    id: int
+    call_id: str  # внешний ID звонка (из phone_recording)
+    chat_title: str
+    started_at: Optional[str]
+    finished_at: Optional[str]
+    transcript_text: Optional[str]
+    summary_text: Optional[str]
+    ai_review: Optional[str]  # JSON: {rating, explanation, errors}
+    participant_telegram_ids: Optional[str]  # JSON list
+    created_at: Optional[str]
+
+
+@dataclass
+class CallParticipant:
+    id: int
+    call_db_id: int  # FK → calls.id
+    contact_id: int  # FK → contacts.id
+
+
+@dataclass
 class ClientCard:
     id: int
     contact_id: int
@@ -69,6 +90,21 @@ def _row_to_employee(row: aiosqlite.Row) -> Employee:
         role=row["role"],
         experience_text=row["experience_text"],
         rating=row["rating"],
+    )
+
+
+def _row_to_call(row: aiosqlite.Row) -> Call:
+    return Call(
+        id=row["id"],
+        call_id=row["call_id"],
+        chat_title=row["chat_title"],
+        started_at=row["started_at"],
+        finished_at=row["finished_at"],
+        transcript_text=row["transcript_text"],
+        summary_text=row["summary_text"],
+        ai_review=row["ai_review"],
+        participant_telegram_ids=row["participant_telegram_ids"],
+        created_at=row["created_at"],
     )
 
 
@@ -131,6 +167,28 @@ async def init_db() -> None:
                 notes               TEXT,
                 assigned_employees  TEXT,
                 created_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS calls (
+                id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+                call_id                 TEXT UNIQUE NOT NULL,
+                chat_title              TEXT NOT NULL,
+                started_at              TEXT,
+                finished_at             TEXT,
+                transcript_text         TEXT,
+                summary_text            TEXT,
+                ai_review               TEXT,
+                participant_telegram_ids TEXT,
+                created_at              TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS call_participants (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                call_db_id  INTEGER NOT NULL REFERENCES calls(id),
+                contact_id  INTEGER NOT NULL REFERENCES contacts(id),
+                UNIQUE(call_db_id, contact_id)
             )
         """)
         await db.commit()
@@ -458,3 +516,104 @@ async def list_client_cards() -> list[ClientCard]:
         async with db.execute("SELECT * FROM client_cards ORDER BY created_at DESC") as cur:
             rows = await cur.fetchall()
     return [_row_to_client_card(r) for r in rows]
+
+
+# ─────────────────────────────────────────────────────────────────
+# Звонки
+# ─────────────────────────────────────────────────────────────────
+async def create_call(
+    call_id: str,
+    chat_title: str,
+    started_at: Optional[str] = None,
+    finished_at: Optional[str] = None,
+    transcript_text: Optional[str] = None,
+    summary_text: Optional[str] = None,
+    participant_telegram_ids: Optional[str] = None,
+) -> Call:
+    async with aiosqlite.connect(DB_PATH) as conn:
+        conn.row_factory = aiosqlite.Row
+        await conn.execute(
+            """INSERT INTO calls
+               (call_id, chat_title, started_at, finished_at, transcript_text, summary_text, participant_telegram_ids)
+               VALUES (?,?,?,?,?,?,?)""",
+            (call_id, chat_title, started_at, finished_at, transcript_text, summary_text, participant_telegram_ids),
+        )
+        await conn.commit()
+        async with conn.execute("SELECT * FROM calls WHERE id = last_insert_rowid()") as cur:
+            return _row_to_call(await cur.fetchone())
+
+
+async def get_call_by_call_id(call_id: str) -> Optional[Call]:
+    async with aiosqlite.connect(DB_PATH) as conn:
+        conn.row_factory = aiosqlite.Row
+        async with conn.execute("SELECT * FROM calls WHERE call_id = ?", (call_id,)) as cur:
+            row = await cur.fetchone()
+    return _row_to_call(row) if row else None
+
+
+async def get_call_by_id(db_id: int) -> Optional[Call]:
+    async with aiosqlite.connect(DB_PATH) as conn:
+        conn.row_factory = aiosqlite.Row
+        async with conn.execute("SELECT * FROM calls WHERE id = ?", (db_id,)) as cur:
+            row = await cur.fetchone()
+    return _row_to_call(row) if row else None
+
+
+async def update_call(call_id: str, **fields) -> Optional[Call]:
+    allowed = {"transcript_text", "summary_text", "ai_review", "participant_telegram_ids"}
+    updates = {k: v for k, v in fields.items() if k in allowed and v is not None}
+    if not updates:
+        return await get_call_by_call_id(call_id)
+    set_clause = ", ".join(f"{k}=?" for k in updates)
+    values = list(updates.values()) + [call_id]
+    async with aiosqlite.connect(DB_PATH) as conn:
+        conn.row_factory = aiosqlite.Row
+        await conn.execute(f"UPDATE calls SET {set_clause} WHERE call_id=?", values)
+        await conn.commit()
+        async with conn.execute("SELECT * FROM calls WHERE call_id=?", (call_id,)) as cur:
+            row = await cur.fetchone()
+    return _row_to_call(row) if row else None
+
+
+async def list_calls() -> list[Call]:
+    async with aiosqlite.connect(DB_PATH) as conn:
+        conn.row_factory = aiosqlite.Row
+        async with conn.execute("SELECT * FROM calls ORDER BY created_at DESC") as cur:
+            rows = await cur.fetchall()
+    return [_row_to_call(r) for r in rows]
+
+
+async def add_call_participant(call_db_id: int, contact_id: int) -> None:
+    async with aiosqlite.connect(DB_PATH) as conn:
+        await conn.execute(
+            "INSERT OR IGNORE INTO call_participants (call_db_id, contact_id) VALUES (?,?)",
+            (call_db_id, contact_id),
+        )
+        await conn.commit()
+
+
+async def get_calls_by_contact(contact_id: int) -> list[Call]:
+    async with aiosqlite.connect(DB_PATH) as conn:
+        conn.row_factory = aiosqlite.Row
+        async with conn.execute(
+            """SELECT c.* FROM calls c
+               JOIN call_participants cp ON cp.call_db_id = c.id
+               WHERE cp.contact_id = ?
+               ORDER BY c.created_at DESC""",
+            (contact_id,),
+        ) as cur:
+            rows = await cur.fetchall()
+    return [_row_to_call(r) for r in rows]
+
+
+async def get_call_participants(call_db_id: int) -> list[Contact]:
+    async with aiosqlite.connect(DB_PATH) as conn:
+        conn.row_factory = aiosqlite.Row
+        async with conn.execute(
+            """SELECT ct.* FROM contacts ct
+               JOIN call_participants cp ON cp.contact_id = ct.id
+               WHERE cp.call_db_id = ?""",
+            (call_db_id,),
+        ) as cur:
+            rows = await cur.fetchall()
+    return [_row_to_contact(r) for r in rows]

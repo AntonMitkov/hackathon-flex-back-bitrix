@@ -1,2 +1,8 @@
 .env
 .venv
+__pycache__/
+*.pyc
+.bot_id
+contacts.db
+recordings/
+data/

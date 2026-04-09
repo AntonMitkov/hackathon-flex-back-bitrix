@@ -21,7 +21,10 @@
       "Bash(python:*)",
       "Bash(python3:*)",
       "Bash(git -C /Users/mitkovanton/Workspace/hackathon-flex log --oneline)",
-      "Bash(git:*)"
+      "Bash(git:*)",
+      "Bash(cp:*)",
+      "Bash(uv sync:*)",
+      "Bash(wc -l /Users/mitkovanton/Workspace/hackathon-flex/*.py /Users/mitkovanton/Workspace/hackathon-flex/phone_recording/*.py)"
     ]
   }
 }
