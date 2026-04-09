@@ -143,13 +143,38 @@ async def get_or_register_bot() -> int:
             await b24("imbot.update", {
                 "BOT_ID": bot_id,
                 "CLIENT_ID": BOT_TOKEN,
-                "EVENT_HANDLER":     f"{WEBHOOK_URL}/event",
-                "EVENT_MESSAGE_ADD": f"{WEBHOOK_URL}/event",
-                "FIELDS": {"NAME": "B2B Bridge"},
+                "FIELDS": {
+                    "EVENT_HANDLER":     f"{WEBHOOK_URL}/event",
+                    "EVENT_MESSAGE_ADD": f"{WEBHOOK_URL}/event",
+                    "PROPERTIES": {
+                        "NAME": "B2B Bridge",
+                        "WORK_POSITION": "Routing Bot",
+                        "COLOR": "AQUA",
+                    },
+                },
             })
             log.info("EVENT_HANDLER обновлён")
         except Exception as e:
-            log.warning("Не удалось обновить бота: %s", e)
+            log.warning("Не удалось обновить бота: %s, пробуем перерегистрацию...", e)
+            try:
+                BOT_ID_FILE.unlink(missing_ok=True)
+                result = await b24("imbot.register", {
+                    "CODE": "b2b_routing_bridge_v1",
+                    "TYPE": "B",
+                    "CLIENT_ID": BOT_TOKEN,
+                    "EVENT_HANDLER":     f"{WEBHOOK_URL}/event",
+                    "EVENT_MESSAGE_ADD": f"{WEBHOOK_URL}/event",
+                    "PROPERTIES": {
+                        "NAME": "B2B Bridge",
+                        "WORK_POSITION": "Routing Bot",
+                        "COLOR": "AQUA",
+                    },
+                })
+                bot_id = int(result)
+                BOT_ID_FILE.write_text(str(bot_id))
+                log.info("Бот перерегистрирован, ID=%d", bot_id)
+            except Exception as e2:
+                log.error("Перерегистрация бота не удалась: %s", e2)
         return bot_id
 
     log.info("Регистрируем бота...")
