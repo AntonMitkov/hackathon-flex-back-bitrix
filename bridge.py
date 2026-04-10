@@ -73,7 +73,7 @@ BOT_TOKEN        = os.getenv("BOT_TOKEN", "my_secret_bot_token")
 BITRIX_APP_TOKEN = os.getenv("BITRIX_APP_TOKEN", "")  # токен исходящего вебхука
 OPERATOR_USER_ID = int(os.getenv("OPERATOR_USER_ID", "1"))
 WEBHOOK_URL      = os.getenv("WEBHOOK_URL", "https://example.com").rstrip("/")
-SERVER_PORT      = int(os.getenv("SERVER_PORT", "8000"))
+SERVER_PORT      = int(os.getenv("PORT", os.getenv("SERVER_PORT", "8000")))
 
 TG_API_ID        = int(os.getenv("TG_API_ID", "0"))
 TG_API_HASH      = os.getenv("TG_API_HASH", "")
