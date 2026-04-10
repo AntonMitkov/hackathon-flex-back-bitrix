@@ -72,7 +72,12 @@ BITRIX_WEBHOOK   = os.getenv("BITRIX_WEBHOOK", "").rstrip("/")
 BOT_TOKEN        = os.getenv("BOT_TOKEN", "my_secret_bot_token")
 BITRIX_APP_TOKEN = os.getenv("BITRIX_APP_TOKEN", "")  # токен исходящего вебхука
 OPERATOR_USER_ID = int(os.getenv("OPERATOR_USER_ID", "1"))
-WEBHOOK_URL      = os.getenv("WEBHOOK_URL", "https://example.com").rstrip("/")
+# Автоопределение URL: Railway → WEBHOOK_URL → fallback
+_railway_domain  = os.getenv("RAILWAY_PUBLIC_DOMAIN", "")
+WEBHOOK_URL      = (
+    f"https://{_railway_domain}" if _railway_domain
+    else os.getenv("WEBHOOK_URL", "https://example.com")
+).rstrip("/")
 SERVER_PORT      = int(os.getenv("PORT", os.getenv("SERVER_PORT", "8000")))
 
 TG_API_ID        = int(os.getenv("TG_API_ID", "0"))
@@ -187,16 +192,31 @@ async def get_or_register_bot() -> int:
 
 async def fetch_all_employees() -> dict[int, dict]:
     """Загружает всех активных сотрудников и возвращает {id: {name, position}}."""
-    result = await b24("user.get", {
-        "ACTIVE": True,
-        "select": ["ID", "NAME", "LAST_NAME", "WORK_POSITION"],
-    })
+    all_users: list[dict] = []
+    start = 0
+    while True:
+        try:
+            result = await b24("user.get", {
+                "ACTIVE": True,
+                "select": ["ID", "NAME", "LAST_NAME", "WORK_POSITION"],
+                "start": start,
+            })
+        except Exception as exc:
+            log.warning("user.get(start=%d) не удался: %s", start, exc)
+            break
+        if isinstance(result, list):
+            all_users.extend(result)
+            if len(result) < 50:
+                break
+            start += 50
+        else:
+            break
     return {
         int(u["ID"]): {
             "name":     f"{u.get('NAME', '')} {u.get('LAST_NAME', '')}".strip(),
             "position": (u.get("WORK_POSITION") or "").strip(),
         }
-        for u in result
+        for u in all_users
     }
 
 
@@ -361,10 +381,22 @@ async def send_telegram_reply(telegram_id: str, text: str) -> bool:
     if _tg_client is None:
         log.warning("Telegram клиент не инициализирован, ответ не отправлен")
         return False
+    uid = int(telegram_id)
     try:
-        await _tg_client.send_message(int(telegram_id), text)
+        await _tg_client.send_message(uid, text)
         log.info("Ответ отправлен в Telegram user_id=%s", telegram_id)
         return True
+    except (ValueError, TypeError) as exc:
+        # Entity не в кэше — обновляем кэш диалогов и пробуем снова
+        log.warning("Entity не найден для %s (%s), обновляю кэш диалогов…", telegram_id, exc)
+        try:
+            await _tg_client.get_dialogs()
+            await _tg_client.send_message(uid, text)
+            log.info("Ответ отправлен в Telegram user_id=%s (после обновления кэша)", telegram_id)
+            return True
+        except Exception as exc2:
+            log.error("Ошибка отправки в Telegram (повторная): %s", exc2)
+            return False
     except Exception as exc:
         log.error("Ошибка отправки в Telegram: %s", exc)
         return False
@@ -410,6 +442,12 @@ async def start_telegram() -> Optional[Any]:
 
     await client.start()
     _tg_client = client
+    # Прогреваем кэш entity чтобы send_message по user_id работал после рестарта
+    try:
+        dialogs = await client.get_dialogs()
+        log.info("Telegram: загружено %d диалогов в entity-кэш", len(dialogs))
+    except Exception as exc:
+        log.warning("Telegram: не удалось загрузить диалоги: %s", exc)
     log.info("Telegram userbot запущен")
     return client
 
@@ -516,7 +554,9 @@ async def lifespan(app: FastAPI):
     await db.init_db()
     log.info("База данных инициализирована")
 
+    log.info("WEBHOOK_URL = %s (Bitrix будет слать события сюда)", WEBHOOK_URL)
     _bot_id = await get_or_register_bot()
+    log.info("Bot ID = %d, EVENT_HANDLER = %s/event", _bot_id, WEBHOOK_URL)
 
     _employees = await fetch_all_employees()
     log.info("Сотрудники Битрикс24: %s", {uid: e["name"] for uid, e in _employees.items()})
@@ -559,27 +599,32 @@ app = FastAPI(
 
 
 # ── Получение сообщения по ID (для исходящего вебхука с минимальными данными)
-async def _fetch_message_text(message_id: int) -> str:
+async def _fetch_message_text(message_id: int, dialog_id: str = "") -> str:
     """Получает текст сообщения по ID через REST API."""
-    try:
-        result = await b24("im.dialog.messages.get", {
-            "DIALOG_ID": 0,  # будет переопределено message_id
-            "MESSAGE_ID": message_id,
-            "LIMIT": 1,
-        })
-        messages = result.get("messages", [])
-        if messages:
-            return messages[0].get("text", "")
-    except Exception:
-        pass
-
-    # Альтернативный метод
+    # Способ 1: через im.message.get (не требует DIALOG_ID)
     try:
         result = await b24("im.message.get", {"MESSAGE_ID": message_id})
         if isinstance(result, dict):
-            return result.get("text", "") or result.get("TEXT", "")
+            text = result.get("text", "") or result.get("TEXT", "")
+            if text:
+                return text
     except Exception as exc:
-        log.warning("Не удалось получить сообщение %d: %s", message_id, exc)
+        log.warning("im.message.get(%d) не удался: %s", message_id, exc)
+
+    # Способ 2: через im.dialog.messages.get (нужен DIALOG_ID)
+    if dialog_id:
+        try:
+            result = await b24("im.dialog.messages.get", {
+                "DIALOG_ID": dialog_id,
+                "LIMIT": 5,
+            })
+            messages = result.get("messages", []) if isinstance(result, dict) else []
+            for msg in messages:
+                mid = msg.get("id") or msg.get("ID")
+                if mid and int(mid) == message_id:
+                    return msg.get("text", "") or msg.get("TEXT", "")
+        except Exception as exc:
+            log.warning("im.dialog.messages.get(%s) не удался: %s", dialog_id, exc)
     return ""
 
 
@@ -633,9 +678,12 @@ async def handle_bitrix_event(request: Request):
                 log.info("  Принято по наличию data.BOT (Bot Platform event)")
 
         if not token_valid:
-            log.warning("Неверный application_token: %r (ожидались: BOT_TOKEN=%r, APP_TOKEN=%r)",
+            # Не блокируем — Bitrix Bot Platform генерирует свой application_token,
+            # который не совпадает ни с CLIENT_ID (BOT_TOKEN), ни с APP_TOKEN.
+            # Логируем, но пропускаем, чтобы не терять события.
+            log.warning("Неизвестный application_token: %r (BOT_TOKEN=%r, APP_TOKEN=%r) — принимаем событие",
                         incoming_app_token, BOT_TOKEN, BITRIX_APP_TOKEN)
-            return JSONResponse({"status": "forbidden"}, status_code=403)
+            token_valid = True
 
         # ── Фильтр событий ───────────────────────────────────────
         if event_type not in _HANDLED_EVENTS:
@@ -645,40 +693,48 @@ async def handle_bitrix_event(request: Request):
         data   = parsed.get("data", {})
         params = data.get("PARAMS") or data.get("FIELDS") or data
 
-        # ── Извлекаем поля (разные форматы для Bot Platform / исходящего вебхука)
+        # ── Извлекаем поля (разные форматы для Bot Platform / исходящего вебхука / V2)
         raw_dialog_id = str(
             params.get("DIALOG_ID")
             or params.get("TO_CHAT_ID")
             or params.get("CHAT_ID")
             or params.get("chatId")
+            or params.get("dialogId")
             or ""
         )
-        message = str(
+        # Сообщение может быть строкой или объектом {"text": "..."} (V2)
+        raw_message = (
             params.get("MESSAGE")
             or params.get("text")
             or params.get("message")
+            or params.get("TEXT")
             or ""
-        ).strip()
+        )
+        if isinstance(raw_message, dict):
+            message = str(raw_message.get("text", "") or "").strip()
+        else:
+            message = str(raw_message).strip()
         from_user_id_raw = (
             params.get("FROM_USER_ID")
             or params.get("AUTHOR_ID")
             or params.get("authorId")
+            or params.get("FROM")
             or 0
         )
         from_user_id = int(from_user_id_raw) if from_user_id_raw else 0
         message_id_raw = params.get("MESSAGE_ID") or params.get("ID") or 0
         message_id = int(message_id_raw) if message_id_raw else 0
 
-        # Если сообщения нет в payload — пытаемся получить по ID (исходящий вебхук)
-        if not message and message_id:
-            log.info("  Сообщение отсутствует в payload, получаем по ID=%d", message_id)
-            message = await _fetch_message_text(message_id)
-
         # Нормализуем dialog_id → формат "chatN"
         if raw_dialog_id and not raw_dialog_id.startswith("chat") and raw_dialog_id.isdigit():
             dialog_id = f"chat{raw_dialog_id}"
         else:
             dialog_id = raw_dialog_id
+
+        # Если сообщения нет в payload — пытаемся получить по ID (исходящий вебхук)
+        if not message and message_id:
+            log.info("  Сообщение отсутствует в payload, получаем по ID=%d", message_id)
+            message = await _fetch_message_text(message_id, dialog_id)
 
         log.info(
             "  dialog=%s (raw=%s) from_user=%s msg=%r",

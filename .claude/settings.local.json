@@ -33,7 +33,9 @@
       "Bash(for chat_id in 92 94 96)",
       "Bash(do echo:*)",
       "Bash(/dev/null done:*)",
-      "Bash(find /Users/mitkovanton/Workspace/hackathon-flex -not -path *.venv* -not -path *__pycache__* -not -path .git/* -type f)"
+      "Bash(find /Users/mitkovanton/Workspace/hackathon-flex -not -path *.venv* -not -path *__pycache__* -not -path .git/* -type f)",
+      "Bash(grep -E \"\\\\.py$|\\\\.json$|\\\\.toml$|\\\\.env\")",
+      "Bash(find /Users/mitkovanton/Workspace/hackathon-flex -maxdepth 1 -name README* -o -name *.md)"
     ]
   }
 }
