@@ -1,6 +1,3 @@
 [build]
 builder = "nixpacks"
 
-[environments.production.deploy]
-healthcheckPath = "/health"
-healthcheckTimeout = 30
